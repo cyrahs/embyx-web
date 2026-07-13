@@ -8,13 +8,15 @@ and a packaged React management page while keeping filesystem mutation independe
 - Framework-independent `FillActorService` with explicit scan/plan/apply boundaries.
 - SQLite and in-memory repositories for plans, private candidates, results, durable jobs, leases, and move journals.
 - Explicit SQLite migrations, WAL mode, write-readiness probes, cancellation-safe operations, and restart recovery.
-- A bounded persisted scan queue with atomic claim/lease/heartbeat fencing across processes.
+- A bounded persisted scan queue with atomic claim/lease/heartbeat fencing across processes and durable, idempotent
+  cancellation of queued or running scans.
 - Linux atomic no-overwrite moves using `renameat2(RENAME_NOREPLACE)`, with a same-filesystem hard-link/quarantine
   fallback for NFS servers that reject rename flags, plus a cross-process advisory lock.
 - Recovery for current atomic moves and legacy `prepared`, `linked`, and `source_removed` journal states.
 - FastAPI endpoints with stable JSON error codes, request/actor/video limits, readiness checks, and Bearer auth for writes.
-- React + TypeScript + Vite UI with polling, grouped results, move confirmation, conflicts, partial failures, one-click
-  bulk magnet copying, RSSHub cache readiness, FreshRSS hand-off, and stale-plan recovery.
+- React + TypeScript + Vite UI with polling, in-progress scan cancellation, grouped results, move confirmation,
+  conflicts, partial failures, one-click bulk magnet copying, RSSHub cache readiness, FreshRSS hand-off, and
+  stale-plan recovery.
 - Per-actor RSSHub feed prewarming persisted alongside scan jobs, with lease-fenced updates and cache-HIT detection before
   a FreshRSS subscription action is exposed.
 - Static frontend assets included in the Python wheel.
@@ -35,8 +37,8 @@ private repository records. Applying a candidate follows this sequence:
 
 If a process stops after the rename but before persistence, startup reconciliation compares both paths with the recorded
 fingerprint. Ambiguous replacements and failed quarantine/rollback operations remain unreconciled for a later retry;
-plans with such journals cannot be purged or explicitly deleted. Cancellation waits for native filesystem and SQLite
-operations to finish before releasing locks or propagating cancellation.
+plans with such journals cannot be purged or explicitly deleted. Cancelling an apply request waits for native
+filesystem and SQLite operations to finish before releasing locks or propagating cancellation.
 
 The move source and move-in destination must be on the same filesystem. The host must be Linux. The filesystem must
 support either `renameat2(RENAME_NOREPLACE)` or hard links; a target that supports neither is reported as
@@ -109,12 +111,25 @@ or mounting the media PVC cannot supply code that is absent from the image.
 - `POST /api/fill-actor/plans` validates actor IDs and atomically enqueues a persisted job.
 - `GET /api/fill-actor/plans/{plan_id}` returns `{job, plan, feeds}`. The plan becomes visible once its scan result is
   persisted; the job can remain running briefly while per-actor RSSHub cache probes reach a terminal state.
+- `POST /api/fill-actor/plans/{plan_id}/cancel` atomically cancels a queued or running scan. The first request and
+  repeats after a successful cancellation return `200`; an unknown job returns `404 unknown_plan`, and a job that
+  already reached another terminal state returns `409 plan_not_cancellable`. The persisted representation is
+  `state=failed` with `error_code=job_cancelled`, which the UI presents as a neutral cancellation rather than a
+  failure. This mutation requires Bearer auth but remains available when media roots are temporarily unavailable.
 - `POST /api/fill-actor/plans/{plan_id}/apply` accepts only a published plan and applies opaque candidate IDs with
   revision checking.
 - `GET /api/health` reports database write-readiness and root/sentinel readiness.
 
 Responses never expose private paths or raw exception messages. The queue defaults to 2 workers and at most 32 active
 queued/running jobs per process configuration.
+
+Cancellation first persists the terminal job and pending feed states. When the request reaches the process that owns
+the running job, it then stops the actor-catalog, RSSHub, magnet, and filesystem-scan work before returning success. If
+another process handles the request, the owner observes the lost lease on its next heartbeat and performs the same
+cleanup asynchronously. Filesystem enumeration uses cooperative cancellation and checks its stop token between roots
+and directory entries. A single NFS system call already blocked inside the kernel cannot be interrupted safely; a
+local-owner cancellation response waits for that call to return and for the scan worker to exit instead of claiming
+the task stopped while background I/O is still active.
 
 When RSSHub integration is enabled, each scan schedules the cluster-local `/javbus/star/{actor-id}` request before
 actor catalog scanning begins. A background `HEAD` probe waits for a successful XML response carrying

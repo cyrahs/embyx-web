@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   ApiError,
   applyCandidates,
+  cancelPlan,
   createPlan,
   getActivePlanId,
   getHealth,
@@ -111,6 +112,10 @@ function jobState(job: PlanJob | null): JobState | null {
 function isJobPending(job: PlanJob | null) {
   const state = jobState(job)
   return state === 'queued' || state === 'running'
+}
+
+function isJobCancelled(job: PlanJob | null) {
+  return jobState(job) === 'failed' && job?.error_code === 'job_cancelled'
 }
 
 function candidateMap(plan: FillActorPlan | null) {
@@ -225,6 +230,7 @@ export default function App() {
     ? { plan_id: recoveredPlanId, state: 'running' }
     : null)
   const [submitting, setSubmitting] = useState(false)
+  const [cancelling, setCancelling] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [pollWarning, setPollWarning] = useState<string | null>(null)
   const [selected, setSelected] = useState<Set<string>>(new Set())
@@ -238,12 +244,16 @@ export default function App() {
   const [now, setNow] = useState(Date.now())
   const lastAutoSelectedRevision = useRef<string | null>(null)
   const pollFailures = useRef(0)
+  const requestGeneration = useRef(0)
+  const activePollController = useRef<AbortController | null>(null)
+  const activeCancelController = useRef<AbortController | null>(null)
   const parsed = useMemo(() => parseActorIds(input), [input])
   const candidates = useMemo(() => candidateMap(plan), [plan])
   const magnets = useMemo(() => planMagnets(plan), [plan])
   const selectedCandidates = [...selected].map((id) => candidates.get(id)).filter(Boolean) as MoveCandidate[]
   const planExpired = Boolean(plan && new Date(plan.expires_at).getTime() <= now)
   const jobPending = isJobPending(job)
+  const jobCancelled = isJobCancelled(job)
   const feedsPending = feeds.some((feed) => feed.state === 'queued' || feed.state === 'warming')
   const envelopePending = jobPending || feedsPending
   const healthReady = Boolean(health && ['ok', 'healthy', 'ready'].includes(health.status.toLowerCase()))
@@ -283,17 +293,21 @@ export default function App() {
   }, [plan])
 
   useEffect(() => {
-    if (!planId || (!isJobPending(job) && !feedsPending) || authRequired) return
+    if (!planId || (!isJobPending(job) && !feedsPending) || cancelling) return
+    const generation = requestGeneration.current
     const controller = new AbortController()
+    activePollController.current = controller
     const delay = Math.min(800 * 2 ** pollFailures.current, 10_000)
     const timer = window.setTimeout(() => {
       void getPlan(planId, controller.signal)
         .then((envelope) => {
+          if (generation !== requestGeneration.current) return
           pollFailures.current = 0
           setPollWarning(null)
           consumeEnvelope(envelope, setPlan, setPlanId, setJob, setFeeds, setError)
         })
         .catch((pollError: unknown) => {
+          if (generation !== requestGeneration.current) return
           if (pollError instanceof DOMException && pollError.name === 'AbortError') return
           if (pollError instanceof ApiError && pollError.code === 'unauthorized') {
             setAuthRequired(true)
@@ -311,12 +325,20 @@ export default function App() {
     return () => {
       window.clearTimeout(timer)
       controller.abort()
+      if (activePollController.current === controller) activePollController.current = null
     }
-  }, [authRequired, feedsPending, job, planId])
+  }, [cancelling, feedsPending, job, planId])
+
+  useEffect(() => () => {
+    requestGeneration.current += 1
+    activePollController.current?.abort()
+    activeCancelController.current?.abort()
+  }, [])
 
   async function startScan() {
     if (!parsed.actorIds.length || parsed.invalid.length || parsed.actorIds.length > MAX_ACTORS) return
     setSubmitting(true)
+    setCancelling(false)
     setError(null)
     setPollWarning(null)
     setActivePlanId(null)
@@ -331,6 +353,9 @@ export default function App() {
     setMagnetCopyError(null)
     lastAutoSelectedRevision.current = null
     pollFailures.current = 0
+    requestGeneration.current += 1
+    activePollController.current?.abort()
+    activeCancelController.current?.abort()
     try {
       consumeEnvelope(await createPlan(parsed.actorIds), setPlan, setPlanId, setJob, setFeeds, setError)
     } catch (scanError) {
@@ -338,6 +363,54 @@ export default function App() {
       setError(errorMessage(scanError))
     } finally {
       setSubmitting(false)
+    }
+  }
+
+  async function cancelScan() {
+    const targetPlanId = planId
+    if (!targetPlanId || !isJobPending(job) || cancelling) return
+    const generation = requestGeneration.current + 1
+    requestGeneration.current = generation
+    activePollController.current?.abort()
+    activeCancelController.current?.abort()
+    const controller = new AbortController()
+    activeCancelController.current = controller
+    setCancelling(true)
+    setError(null)
+    setPollWarning(null)
+
+    try {
+      let envelope: PlanEnvelope
+      try {
+        envelope = await cancelPlan(targetPlanId, controller.signal)
+      } catch (cancelError) {
+        if (
+          cancelError instanceof ApiError &&
+          cancelError.status === 409 &&
+          cancelError.code === 'plan_not_cancellable'
+        ) {
+          envelope = await getPlan(targetPlanId, controller.signal)
+        } else {
+          throw cancelError
+        }
+      }
+      if (generation !== requestGeneration.current) return
+      pollFailures.current = 0
+      consumeEnvelope(envelope, setPlan, setPlanId, setJob, setFeeds, setError)
+    } catch (cancelError) {
+      if (generation !== requestGeneration.current) return
+      if (cancelError instanceof DOMException && cancelError.name === 'AbortError') return
+      if (cancelError instanceof ApiError && cancelError.code === 'unauthorized') setAuthRequired(true)
+      if (cancelError instanceof ApiError && STALE_CODES.has(cancelError.code)) {
+        setNeedsFreshPlan(true)
+        setJob((current) => current ? { ...current, state: 'failed', error_code: cancelError.code } : current)
+      } else {
+        setJob((current) => current ? { ...current } : current)
+      }
+      setError(errorMessage(cancelError))
+    } finally {
+      if (activeCancelController.current === controller) activeCancelController.current = null
+      if (generation === requestGeneration.current) setCancelling(false)
     }
   }
 
@@ -472,10 +545,21 @@ export default function App() {
         </section>
 
         {(submitting || jobPending) && (
-          <ProgressPanel job={job} now={now} pollWarning={pollWarning} submitting={submitting} />
+          <ProgressPanel
+            job={job}
+            planId={planId}
+            now={now}
+            pollWarning={pollWarning}
+            submitting={submitting}
+            cancelling={cancelling}
+            onCancel={() => void cancelScan()}
+          />
         )}
 
         {error && <Notice tone="error" title="操作未完成" body={error} />}
+        {jobCancelled && (
+          <Notice tone="neutral" title="扫描已取消" body="任务已停止，未生成可应用的扫描结果。" />
+        )}
         {(needsFreshPlan || planExpired) && (
           <Notice
             tone="warning"
@@ -485,7 +569,7 @@ export default function App() {
           />
         )}
 
-        {feeds.length > 0 && <ActorFeeds feeds={feeds} />}
+        {feeds.length > 0 && !jobCancelled && <ActorFeeds feeds={feeds} />}
 
         {plan && (
           <>
@@ -579,14 +663,20 @@ export default function App() {
 
 function ProgressPanel({
   job,
+  planId,
   now,
   pollWarning,
   submitting,
+  cancelling,
+  onCancel,
 }: {
   job: PlanJob | null
+  planId: string | null
   now: number
   pollWarning: string | null
   submitting: boolean
+  cancelling: boolean
+  onCancel: () => void
 }) {
   const progress = job?.progress
   const value = progressValue(progress)
@@ -611,6 +701,7 @@ function ProgressPanel({
     && heartbeatAge !== null
     && heartbeatAge >= HEARTBEAT_WARNING_SECONDS
   const valueText = count ?? (value === null ? '进度计算中' : `${Math.round(value)}%`)
+  const canCancel = Boolean(planId && (state === 'queued' || state === 'running'))
 
   return (
     <section className="progress-panel" aria-busy="true" aria-labelledby="scan-progress-title">
@@ -653,6 +744,19 @@ function ProgressPanel({
             {heartbeatWarning && <p>执行器心跳已较长时间未更新，执行可能已经中断。</p>}
           </div>
         )}
+        {canCancel && (
+          <div className="progress-actions">
+            <button
+              className="button secondary cancel-scan-button"
+              type="button"
+              disabled={cancelling}
+              onClick={onCancel}
+            >
+              {cancelling && <Spinner />}
+              {cancelling ? '正在取消' : '取消扫描'}
+            </button>
+          </div>
+        )}
       </div>
     </section>
   )
@@ -671,6 +775,10 @@ function consumeEnvelope(
   setFeeds(envelope.feeds)
   if (envelope.plan) setPlan(envelope.plan)
   const state = jobState(envelope.job)
+  if (isJobCancelled(envelope.job)) {
+    setError(null)
+    return
+  }
   if ((state === 'failed' || state === 'partial_failed') && !envelope.plan) {
     setError(envelope.job?.error_code ? `扫描任务失败：${envelope.job.error_code}` : '扫描任务未能完成。')
   }
@@ -854,10 +962,10 @@ function ApplySummary({ result }: { result: ApplyResult }) {
   )
 }
 
-function Notice({ tone, title, body, action }: { tone: 'error' | 'warning'; title: string; body: string; action?: React.ReactNode }) {
+function Notice({ tone, title, body, action }: { tone: 'error' | 'warning' | 'neutral'; title: string; body: string; action?: React.ReactNode }) {
   return (
-    <div className={`notice notice-${tone}`} role="alert">
-      <span><AlertIcon /></span>
+    <div className={`notice notice-${tone}`} role={tone === 'neutral' ? 'status' : 'alert'}>
+      <span>{tone === 'neutral' ? <CancelIcon /> : <AlertIcon />}</span>
       <div><strong>{title}</strong><p>{body}</p></div>
       {action}
     </div>
@@ -871,6 +979,7 @@ function ArrowIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path 
 function ChevronIcon({ expanded }: { expanded: boolean }) { return <svg className={`chevron ${expanded ? 'expanded' : ''}`} viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg> }
 function CheckIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg> }
 function AlertIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 2.7 20h18.6L12 3Z"/><path d="M12 9v5m0 3h.01"/></svg> }
+function CancelIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="m9 9 6 6m0-6-6 6"/></svg> }
 function CopyIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg> }
 function ExternalIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6m0-6-9 9"/><path d="M19 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h6"/></svg> }
 function FeedIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5a14 14 0 0 1 14 14M5 11a8 8 0 0 1 8 8"/><circle cx="5" cy="19" r="1"/></svg> }

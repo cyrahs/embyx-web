@@ -9,6 +9,8 @@ import pytest
 from embyx_web.fill_actor.feeds import RSSHubFeedWarmer
 from embyx_web.fill_actor.jobs import FillActorJobManager
 from embyx_web.fill_actor.persistence import (
+    JOB_CANCELLED_ERROR_CODE,
+    CancelJobOutcome,
     JobFeedErrorCode,
     JobFeedState,
     JobOperation,
@@ -412,4 +414,47 @@ async def test_shutdown_after_plan_save_cancels_blocked_feed_and_leaves_terminal
     assert terminal.error_code == 'job_interrupted'
     assert feed.state is JobFeedState.FAILED
     assert feed.error_code is JobFeedErrorCode.CANCELLED
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_user_cancel_waits_for_blocked_feed_request_to_exit(tmp_path: Path) -> None:
+    get_started = asyncio.Event()
+    request_cancelled = asyncio.Event()
+    never_release = asyncio.Event()
+
+    async def handler(_request: httpx2.Request) -> httpx2.Response:
+        get_started.set()
+        try:
+            await never_release.wait()
+        except asyncio.CancelledError:
+            request_cancelled.set()
+            raise
+        return httpx2.Response(200, headers={'content-type': 'application/xml'}, content=RSS_BODY)
+
+    repository = MemoryFillActorRepository()
+    service = make_service(tmp_path, ActorCatalog(), repository)
+    client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+    warmer = RSSHubFeedWarmer(repository=repository, rsshub_url='http://rsshub', client=client)
+    manager = FillActorJobManager(
+        service=service,
+        repository=repository,
+        feed_warmer=warmer,
+        token_factory=iter(('owner', 'job')).__next__,
+    )
+
+    job = await manager.start_plan(['actor'])
+    await asyncio.wait_for(get_started.wait(), timeout=1)
+    result = await asyncio.wait_for(manager.cancel_plan(job.job_id), timeout=1)
+
+    assert result.outcome is CancelJobOutcome.CANCELLED
+    assert request_cancelled.is_set()
+    terminal = await repository.get_job(job.job_id)
+    feed = (await repository.list_job_feeds(job.job_id))[0]
+    assert terminal is not None
+    assert terminal.state is JobState.FAILED
+    assert terminal.error_code == JOB_CANCELLED_ERROR_CODE
+    assert feed.state is JobFeedState.FAILED
+    assert feed.error_code is JobFeedErrorCode.CANCELLED
+    await manager.aclose()
     await client.aclose()

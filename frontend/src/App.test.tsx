@@ -413,6 +413,217 @@ describe('Fill Actor page', () => {
     }).feeds).toEqual([{ ...oldFeed, freshrss_url: null }])
   })
 
+  it('cancels a queued scan once, disables the action in flight, and renders a neutral terminal state', async () => {
+    const user = userEvent.setup()
+    const fetchMock = vi.mocked(fetch)
+    let resolveCancel!: (response: Response) => void
+    const pendingCancel = new Promise<Response>((resolve) => {
+      resolveCancel = resolve
+    })
+    fetchMock
+      .mockImplementationOnce(() => jsonResponse({ status: 'ok' }))
+      .mockImplementationOnce(() => jsonResponse({
+        job: { job_id: 'job-1', plan_id: 'plan-1', state: 'queued' },
+        plan: null,
+        feeds: [],
+      }, 202))
+      .mockImplementationOnce(() => pendingCancel)
+
+    render(<App />)
+    await user.type(screen.getByLabelText('演员 ID'), 'A123')
+    await user.click(screen.getByRole('button', { name: '开始扫描' }))
+
+    await user.click(await screen.findByRole('button', { name: '取消扫描' }))
+    expect(screen.getByRole('button', { name: '正在取消' })).toBeDisabled()
+    resolveCancel(new Response(JSON.stringify({
+      job: { job_id: 'job-1', plan_id: 'plan-1', state: 'failed', error_code: 'job_cancelled' },
+      plan: null,
+      feeds: [{
+        actor_id: 'A123',
+        state: 'failed',
+        attempts: 1,
+        updated_at: '2026-07-13T10:02:00Z',
+        error_code: 'rsshub_cancelled',
+        freshrss_add_url: null,
+        freshrss_url: null,
+      }],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+
+    expect(await screen.findByText('扫描已取消')).toBeInTheDocument()
+    expect(screen.queryByText('操作未完成')).not.toBeInTheDocument()
+    expect(screen.queryByText('缓存失败')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '取消扫描' })).not.toBeInTheDocument()
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      '/api/fill-actor/plans/plan-1/cancel',
+      expect.objectContaining({ method: 'POST', signal: expect.any(AbortSignal) }),
+    )
+    await waitFor(() => expect(window.sessionStorage.getItem('embyx-web-active-plan-id')).toBeNull())
+  })
+
+  it('keeps polling and restores cancel after a network failure', async () => {
+    const user = userEvent.setup()
+    const fetchMock = vi.mocked(fetch)
+    fetchMock
+      .mockImplementationOnce(() => jsonResponse({ status: 'ok' }))
+      .mockImplementationOnce(() => jsonResponse({
+        job: { job_id: 'job-1', plan_id: 'plan-1', state: 'running' },
+        plan: null,
+        feeds: [],
+      }, 202))
+      .mockImplementationOnce(() => Promise.reject(new TypeError('temporary offline')))
+      .mockImplementationOnce(() => jsonResponse({
+        job: { job_id: 'job-1', plan_id: 'plan-1', state: 'completed' },
+        plan,
+        feeds: [],
+      }))
+
+    render(<App />)
+    await user.type(screen.getByLabelText('演员 ID'), 'A123')
+    await user.click(screen.getByRole('button', { name: '开始扫描' }))
+    await user.click(await screen.findByRole('button', { name: '取消扫描' }))
+
+    expect(await screen.findByText('无法连接到服务，请检查网络后重试。')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '取消扫描' })).toBeEnabled()
+    expect(screen.queryByText('扫描已取消')).not.toBeInTheDocument()
+    expect(await screen.findByText('扫描结果', {}, { timeout: 2_000 })).toBeInTheDocument()
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      4,
+      '/api/fill-actor/plans/plan-1',
+      expect.objectContaining({ cache: 'no-store', signal: expect.any(AbortSignal) }),
+    )
+  })
+
+  it('restores cancel without fabricating cancellation after a server error', async () => {
+    const user = userEvent.setup()
+    const fetchMock = vi.mocked(fetch)
+    fetchMock
+      .mockImplementationOnce(() => jsonResponse({ status: 'ok' }))
+      .mockImplementationOnce(() => jsonResponse({
+        job: { job_id: 'job-1', plan_id: 'plan-1', state: 'running' },
+        plan: null,
+        feeds: [],
+      }, 202))
+      .mockImplementationOnce(() => jsonResponse({ error: { code: 'cancel_failed' } }, 503))
+
+    render(<App />)
+    await user.type(screen.getByLabelText('演员 ID'), 'A123')
+    await user.click(screen.getByRole('button', { name: '开始扫描' }))
+    await user.click(await screen.findByRole('button', { name: '取消扫描' }))
+
+    expect(await screen.findByText('操作未完成')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '取消扫描' })).toBeEnabled()
+    expect(screen.queryByText('扫描已取消')).not.toBeInTheDocument()
+  })
+
+  it('keeps public status polling active when cancellation requires a token', async () => {
+    const user = userEvent.setup()
+    const fetchMock = vi.mocked(fetch)
+    fetchMock
+      .mockImplementationOnce(() => jsonResponse({ status: 'ok' }))
+      .mockImplementationOnce(() => jsonResponse({
+        job: { job_id: 'job-1', plan_id: 'plan-1', state: 'running' },
+        plan: null,
+        feeds: [],
+      }, 202))
+      .mockImplementationOnce(() => jsonResponse({ error: { code: 'unauthorized' } }, 401))
+      .mockImplementationOnce(() => jsonResponse({
+        job: { job_id: 'job-1', plan_id: 'plan-1', state: 'completed' },
+        plan,
+        feeds: [],
+      }))
+
+    render(<App />)
+    await user.type(screen.getByLabelText('演员 ID'), 'A123')
+    await user.click(screen.getByRole('button', { name: '开始扫描' }))
+    await user.click(await screen.findByRole('button', { name: '取消扫描' }))
+
+    expect(await screen.findByText('需要 API Token')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '取消扫描' })).toBeEnabled()
+    expect(screen.queryByText('扫描已取消')).not.toBeInTheDocument()
+
+    expect(await screen.findByText('扫描结果', {}, { timeout: 2_000 })).toBeInTheDocument()
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      4,
+      '/api/fill-actor/plans/plan-1',
+      expect.objectContaining({
+        signal: expect.any(AbortSignal),
+      }),
+    )
+    expect(window.sessionStorage.getItem('embyx-web-api-token')).toBeNull()
+  })
+
+  it('refreshes the current plan after a plan_not_cancellable race', async () => {
+    const user = userEvent.setup()
+    const fetchMock = vi.mocked(fetch)
+    fetchMock
+      .mockImplementationOnce(() => jsonResponse({ status: 'ok' }))
+      .mockImplementationOnce(() => jsonResponse({
+        job: { job_id: 'job-1', plan_id: 'plan-1', state: 'running' },
+        plan: null,
+        feeds: [],
+      }, 202))
+      .mockImplementationOnce(() => jsonResponse({ error: { code: 'plan_not_cancellable' } }, 409))
+      .mockImplementationOnce(() => jsonResponse({
+        job: { job_id: 'job-1', plan_id: 'plan-1', state: 'completed' },
+        plan,
+        feeds: [],
+      }))
+
+    render(<App />)
+    await user.type(screen.getByLabelText('演员 ID'), 'A123')
+    await user.click(screen.getByRole('button', { name: '开始扫描' }))
+    await user.click(await screen.findByRole('button', { name: '取消扫描' }))
+
+    expect(await screen.findByText('扫描结果')).toBeInTheDocument()
+    expect(screen.queryByText('操作未完成')).not.toBeInTheDocument()
+    expect(screen.queryByText('扫描已取消')).not.toBeInTheDocument()
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      4,
+      '/api/fill-actor/plans/plan-1',
+      expect.objectContaining({ cache: 'no-store', signal: expect.any(AbortSignal) }),
+    )
+  })
+
+  it('ignores an older poll response after cancellation wins the race', async () => {
+    const user = userEvent.setup()
+    const fetchMock = vi.mocked(fetch)
+    let resolvePoll!: (response: Response) => void
+    const pendingPoll = new Promise<Response>((resolve) => {
+      resolvePoll = resolve
+    })
+    fetchMock
+      .mockImplementationOnce(() => jsonResponse({ status: 'ok' }))
+      .mockImplementationOnce(() => jsonResponse({
+        job: { job_id: 'job-1', plan_id: 'plan-1', state: 'running' },
+        plan: null,
+        feeds: [],
+      }, 202))
+      .mockImplementationOnce(() => pendingPoll)
+      .mockImplementationOnce(() => jsonResponse({
+        job: { job_id: 'job-1', plan_id: 'plan-1', state: 'failed', error_code: 'job_cancelled' },
+        plan: null,
+        feeds: [],
+      }))
+
+    render(<App />)
+    await user.type(screen.getByLabelText('演员 ID'), 'A123')
+    await user.click(screen.getByRole('button', { name: '开始扫描' }))
+    const cancelButton = await screen.findByRole('button', { name: '取消扫描' })
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3), { timeout: 2_000 })
+    await user.click(cancelButton)
+
+    expect(await screen.findByText('扫描已取消')).toBeInTheDocument()
+    resolvePoll(new Response(JSON.stringify({
+      job: { job_id: 'job-1', plan_id: 'plan-1', state: 'running' },
+      plan: null,
+      feeds: [],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    await Promise.resolve()
+    expect(screen.getByText('扫描已取消')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '取消扫描' })).not.toBeInTheDocument()
+  })
+
   it('shows an explicit recovery action when apply reports an expired plan', async () => {
     const user = userEvent.setup()
     const fetchMock = vi.mocked(fetch)

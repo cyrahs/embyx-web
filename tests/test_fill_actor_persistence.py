@@ -16,6 +16,8 @@ from embyx_web.fill_actor.models import (
     VideoState,
 )
 from embyx_web.fill_actor.persistence import (
+    JOB_CANCELLED_ERROR_CODE,
+    CancelJobOutcome,
     CandidateRecord,
     FileFingerprint,
     InvalidMoveJournalTransitionError,
@@ -577,6 +579,184 @@ async def test_job_feed_updates_require_current_owner_and_unexpired_lease(
     assert saved.attempts == 1
     assert saved.error_code is JobFeedErrorCode.CANCELLED
     assert saved.freshrss_add_url == feed.freshrss_add_url
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('repository_kind', ['memory', 'sqlite'])
+async def test_cancel_job_atomically_terminalizes_running_job_and_pending_feeds(
+    tmp_path: Path,
+    repository_kind: str,
+) -> None:
+    repository = make_repository(repository_kind, tmp_path)
+    now = datetime(2026, 7, 13, 10, 0, tzinfo=UTC)
+    queued = JobRecord(
+        job_id='cancel-job',
+        plan_id='cancel-job',
+        operation=JobOperation.CREATE_PLAN,
+        state=JobState.QUEUED,
+        created_at=now,
+        updated_at=now,
+        actor_ids=('pending', 'ready'),
+    )
+    feeds = (
+        JobFeedRecord(
+            job_id=queued.job_id,
+            actor_id='pending',
+            state=JobFeedState.QUEUED,
+            attempts=0,
+            updated_at=now,
+        ),
+        JobFeedRecord(
+            job_id=queued.job_id,
+            actor_id='ready',
+            state=JobFeedState.QUEUED,
+            attempts=0,
+            updated_at=now,
+        ),
+    )
+    assert await repository.enqueue_job(queued, max_active=1, feeds=feeds)
+    claimed = await repository.claim_next_job(
+        owner_id='owner',
+        now=now,
+        lease_expires_at=now + timedelta(seconds=30),
+    )
+    assert claimed is not None
+    assert await repository.update_owned_job_feed(
+        job_id=queued.job_id,
+        actor_id='pending',
+        owner_id='owner',
+        state=JobFeedState.WARMING,
+        attempts=1,
+        error_code=None,
+        now=now + timedelta(seconds=1),
+    )
+    assert await repository.update_owned_job_feed(
+        job_id=queued.job_id,
+        actor_id='ready',
+        owner_id='owner',
+        state=JobFeedState.READY,
+        attempts=1,
+        error_code=None,
+        now=now + timedelta(seconds=1),
+    )
+
+    cancelled_at = now + timedelta(seconds=2)
+    result = await repository.cancel_job(job_id=queued.job_id, now=cancelled_at)
+
+    assert result.outcome is CancelJobOutcome.CANCELLED
+    assert result.previous_state is JobState.RUNNING
+    assert result.previous_owner_id == 'owner'
+    assert result.job is not None
+    assert result.job.state is JobState.FAILED
+    assert result.job.error_code == JOB_CANCELLED_ERROR_CODE
+    assert result.job.owner_id is None
+    assert result.job.lease_expires_at is None
+    assert result.job.progress is not None
+    assert result.job.progress.stage is JobStage.DONE
+    saved_feeds = {feed.actor_id: feed for feed in await repository.list_job_feeds(queued.job_id)}
+    assert saved_feeds['pending'].state is JobFeedState.FAILED
+    assert saved_feeds['pending'].error_code is JobFeedErrorCode.CANCELLED
+    assert saved_feeds['ready'].state is JobFeedState.READY
+    assert saved_feeds['ready'].error_code is None
+    assert not await repository.renew_owned_job_lease(
+        job_id=queued.job_id,
+        owner_id='owner',
+        now=cancelled_at,
+        lease_expires_at=cancelled_at + timedelta(seconds=30),
+    )
+    assert not await repository.finish_owned_job(
+        job_id=queued.job_id,
+        owner_id='owner',
+        state=JobState.COMPLETED,
+        error_code=None,
+        now=cancelled_at,
+        progress=result.job.progress,
+    )
+    repeated = await repository.cancel_job(job_id=queued.job_id, now=cancelled_at + timedelta(seconds=1))
+    assert repeated.outcome is CancelJobOutcome.ALREADY_CANCELLED
+    assert repeated.job == result.job
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('repository_kind', ['memory', 'sqlite'])
+async def test_cancel_queued_job_prevents_claim_and_releases_capacity(tmp_path: Path, repository_kind: str) -> None:
+    repository = make_repository(repository_kind, tmp_path)
+    now = datetime(2026, 7, 13, 10, 0, tzinfo=UTC)
+    queued = JobRecord(
+        job_id='queued-cancel',
+        plan_id='queued-cancel',
+        operation=JobOperation.CREATE_PLAN,
+        state=JobState.QUEUED,
+        created_at=now,
+        updated_at=now,
+    )
+    assert await repository.enqueue_job(queued, max_active=1)
+
+    result = await repository.cancel_job(job_id=queued.job_id, now=now + timedelta(seconds=1))
+
+    assert result.outcome is CancelJobOutcome.CANCELLED
+    assert result.previous_state is JobState.QUEUED
+    assert (
+        await repository.claim_next_job(
+            owner_id='owner',
+            now=now + timedelta(seconds=2),
+            lease_expires_at=now + timedelta(seconds=32),
+        )
+        is None
+    )
+    replacement = JobRecord(
+        job_id='replacement',
+        operation=JobOperation.CREATE_PLAN,
+        state=JobState.QUEUED,
+        created_at=now + timedelta(seconds=2),
+        updated_at=now + timedelta(seconds=2),
+    )
+    assert await repository.enqueue_job(replacement, max_active=1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('repository_kind', ['memory', 'sqlite'])
+async def test_cancel_and_finish_have_one_atomic_winner(tmp_path: Path, repository_kind: str) -> None:
+    repository = make_repository(repository_kind, tmp_path)
+    now = datetime(2026, 7, 13, 10, 0, tzinfo=UTC)
+    queued = JobRecord(
+        job_id='finish-race',
+        plan_id='finish-race',
+        operation=JobOperation.CREATE_PLAN,
+        state=JobState.QUEUED,
+        created_at=now,
+        updated_at=now,
+    )
+    assert await repository.enqueue_job(queued, max_active=1)
+    claimed = await repository.claim_next_job(
+        owner_id='owner',
+        now=now,
+        lease_expires_at=now + timedelta(seconds=30),
+    )
+    assert claimed is not None
+    assert claimed.progress is not None
+
+    cancel_result, finished = await asyncio.gather(
+        repository.cancel_job(job_id=queued.job_id, now=now + timedelta(seconds=1)),
+        repository.finish_owned_job(
+            job_id=queued.job_id,
+            owner_id='owner',
+            state=JobState.COMPLETED,
+            error_code=None,
+            now=now + timedelta(seconds=1),
+            progress=claimed.progress,
+        ),
+    )
+    current = await repository.get_job(queued.job_id)
+    assert current is not None
+    if cancel_result.outcome is CancelJobOutcome.CANCELLED:
+        assert not finished
+        assert current.state is JobState.FAILED
+        assert current.error_code == JOB_CANCELLED_ERROR_CODE
+    else:
+        assert cancel_result.outcome is CancelJobOutcome.ALREADY_TERMINAL
+        assert finished
+        assert current.state is JobState.COMPLETED
 
 
 def test_sqlite_repository_rejects_unknown_future_schema(tmp_path: Path) -> None:

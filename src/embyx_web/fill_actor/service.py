@@ -6,6 +6,7 @@ import inspect
 import os
 import re
 import secrets
+import threading
 from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -80,6 +81,7 @@ class FillActorPaths:
 _Fingerprint = FileFingerprint
 _MoveRecord = CandidateRecord
 _MUTATION_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix='embyx-move')
+_SCAN_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix='embyx-scan')
 _AT_FDCWD = -100
 _RENAME_NOREPLACE = 1
 _RENAME_NOREPLACE_UNSUPPORTED = {errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP}
@@ -90,7 +92,13 @@ async def _unlocked() -> AsyncIterator[None]:
     yield
 
 
-async def _await_mutation_future[T](worker: Future[T], *, propagate_cancellation: bool = True) -> T:
+async def _await_executor_future[T](
+    worker: Future[T],
+    *,
+    cancellation_wins: bool = False,
+    on_cancel: Callable[[], None] | None = None,
+    propagate_cancellation: bool = True,
+) -> T:
     """Wait for an executor future that cannot be cancelled by event-loop task shutdown."""
     loop = asyncio.get_running_loop()
     completed = loop.create_future()
@@ -106,10 +114,26 @@ async def _await_mutation_future[T](worker: Future[T], *, propagate_cancellation
             await asyncio.shield(completed)
         except asyncio.CancelledError:
             cancelled = True
+            if on_cancel is not None:
+                on_cancel()
+    if cancelled and propagate_cancellation and cancellation_wins:
+        worker.exception()
+        raise asyncio.CancelledError
+    if cancelled and propagate_cancellation and on_cancel is not None:
+        # Scan cancellation wins even if the NFS operation reports an error
+        # while unwinding. The worker has finished, so consuming its exception
+        # here cannot leave executor work behind.
+        with suppress(Exception):
+            worker.result()
+        raise asyncio.CancelledError
     result = worker.result()
     if cancelled and propagate_cancellation:
         raise asyncio.CancelledError
     return result
+
+
+async def _await_mutation_future[T](worker: Future[T], *, propagate_cancellation: bool = True) -> T:
+    return await _await_executor_future(worker, propagate_cancellation=propagate_cancellation)
 
 
 def _rename_no_replace(source: Path, destination: Path) -> None:
@@ -188,6 +212,7 @@ class FillActorService:
         self._move_in_by_brand = move_in_by_brand
         self._in_flight: dict[tuple[str, str], asyncio.Task[MoveResult]] = {}
         self._mutation_futures: set[Future[MoveResult]] = set()
+        self._scan_futures: dict[Future[object], threading.Event] = {}
         self._apply_lock = asyncio.Lock()
 
     async def create_plan(  # noqa: C901, PLR0915
@@ -395,7 +420,7 @@ class FillActorService:
                 False,
             )
 
-        existing = await asyncio.to_thread(
+        existing = await self._run_scan(
             self._find_matching_files,
             self._paths.actor_brand_path,
             brand,
@@ -413,7 +438,7 @@ class FillActorService:
                 False,
             )
 
-        additional = await asyncio.to_thread(self._find_additional_files, brand, video_id)
+        additional = await self._run_scan(self._find_additional_files, brand, video_id)
         if not additional:
             return (
                 VideoPlan(video_id=video_id, actor_ids=actor_membership, state=VideoState.MISSING),
@@ -509,10 +534,19 @@ class FillActorService:
         return cleaned.upper()
 
     @staticmethod
-    def _find_matching_files(root: Path, brand: str, video_id: str) -> tuple[Path, ...]:
+    def _find_matching_files(
+        root: Path,
+        brand: str,
+        video_id: str,
+        stop_requested: threading.Event | None = None,
+    ) -> tuple[Path, ...]:
+        if stop_requested is not None and stop_requested.is_set():
+            return ()
         if not root.is_dir() or root.is_symlink():
             msg = 'scan root unavailable'
             raise OSError(msg)
+        if stop_requested is not None and stop_requested.is_set():
+            return ()
         brand_path = root / brand
         if not brand_path.is_dir():
             return ()
@@ -523,21 +557,25 @@ class FillActorService:
             msg = 'unsafe brand path'
             raise ValueError(msg)
         pattern = re.compile(rf'^{re.escape(video_id)}(?:-cd\d{{1,2}})?\..+', re.IGNORECASE)
-        return tuple(
-            sorted(
-                (
-                    path
-                    for path in brand_path.iterdir()
-                    if not path.is_symlink() and path.is_file() and pattern.fullmatch(path.name)
-                ),
-                key=lambda p: p.name,
-            )
-        )
+        matches: list[Path] = []
+        for path in brand_path.iterdir():
+            if stop_requested is not None and stop_requested.is_set():
+                return ()
+            if not path.is_symlink() and path.is_file() and pattern.fullmatch(path.name):
+                matches.append(path)
+        return tuple(sorted(matches, key=lambda path: path.name))
 
-    def _find_additional_files(self, brand: str, video_id: str) -> tuple[tuple[int, Path], ...]:
+    def _find_additional_files(
+        self,
+        brand: str,
+        video_id: str,
+        stop_requested: threading.Event | None = None,
+    ) -> tuple[tuple[int, Path], ...]:
         result: list[tuple[int, Path]] = []
         for index, root in enumerate(self._paths.additional_brand_paths):
-            matches = self._find_matching_files(root, brand, video_id)
+            if stop_requested is not None and stop_requested.is_set():
+                return ()
+            matches = self._find_matching_files(root, brand, video_id, stop_requested)
             result.extend((index, path) for path in matches)
         return tuple(sorted(result, key=lambda item: (item[0], item[1].name)))
 
@@ -867,6 +905,11 @@ class FillActorService:
         return await asyncio.to_thread(check)
 
     async def aclose(self) -> None:
+        scan_futures = tuple(self._scan_futures.items())
+        for _worker, stop_requested in scan_futures:
+            stop_requested.set()
+        for worker, _stop_requested in scan_futures:
+            await _await_executor_future(worker, propagate_cancellation=False)
         for worker in tuple(self._mutation_futures):
             await _await_mutation_future(worker, propagate_cancellation=False)
 
@@ -1105,6 +1148,19 @@ class FillActorService:
             return await _await_mutation_future(worker)
         finally:
             self._mutation_futures.discard(worker)
+
+    async def _run_scan[T](self, function: Callable[..., T], *args: object) -> T:
+        stop_requested = threading.Event()
+        worker = _SCAN_EXECUTOR.submit(function, *args, stop_requested)
+        self._scan_futures[worker] = stop_requested
+        try:
+            return await _await_executor_future(
+                worker,
+                cancellation_wins=True,
+                on_cancel=stop_requested.set,
+            )
+        finally:
+            self._scan_futures.pop(worker, None)
 
     async def _candidate_roots_ready(self, record: _MoveRecord) -> bool:
         def check() -> bool:

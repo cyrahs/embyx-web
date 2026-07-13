@@ -4,10 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from embyx_web.fill_actor.errors import JobQueueFullError
+from embyx_web.fill_actor.errors import FillActorError, JobQueueFullError
 from embyx_web.fill_actor.jobs import FillActorJobManager
 from embyx_web.fill_actor.models import FillActorPlan
 from embyx_web.fill_actor.persistence import (
+    JOB_CANCELLED_ERROR_CODE,
+    CancelJobOutcome,
     JobOperation,
     JobProgress,
     JobProgressEvent,
@@ -120,6 +122,103 @@ class FailingFinishRepository(MemoryFillActorRepository):
     async def finish_owned_job(self, **_kwargs):
         msg = 'terminal persistence unavailable'
         raise OSError(msg)
+
+
+class PausedClaimRepository(MemoryFillActorRepository):
+    def __init__(self) -> None:
+        super().__init__()
+        self.claimed = asyncio.Event()
+        self.release_claim = asyncio.Event()
+
+    async def claim_next_job(self, **kwargs):
+        job = await super().claim_next_job(**kwargs)
+        if job is not None:
+            self.claimed.set()
+            await self.release_claim.wait()
+        return job
+
+
+class PausedCancelRepository(MemoryFillActorRepository):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancel_persisted = asyncio.Event()
+        self.release_cancel = asyncio.Event()
+
+    async def cancel_job(self, **kwargs):
+        result = await super().cancel_job(**kwargs)
+        self.cancel_persisted.set()
+        await self.release_cancel.wait()
+        return result
+
+
+class CancellationAwareService(ControlledService):
+    def __init__(self) -> None:
+        super().__init__(block=True)
+        self.cancelled = asyncio.Event()
+
+    async def create_plan(self, *args, **kwargs) -> FillActorPlan:
+        try:
+            return await super().create_plan(*args, **kwargs)
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+
+
+class DirtyProgressService(ControlledService):
+    async def create_plan(self, *args, progress=None, **kwargs) -> FillActorPlan:
+        assert progress is not None
+        await progress(
+            JobProgressEvent(
+                stage=JobStage.ACTOR_CATALOG,
+                completed=0,
+                total=2,
+                unit=JobProgressUnit.ACTORS,
+                current='actor-0',
+            )
+        )
+        await progress(
+            JobProgressEvent(
+                stage=JobStage.ACTOR_CATALOG,
+                completed=1,
+                total=2,
+                unit=JobProgressUnit.ACTORS,
+                current='actor-1',
+            )
+        )
+        self.started.set()
+        await self.release.wait()
+        return await super().create_plan(*args, progress=progress, **kwargs)
+
+
+class FailingDirtyProgressService(ControlledService):
+    def __init__(self, failure_type: type[Exception]) -> None:
+        super().__init__()
+        self.failure_type = failure_type
+
+    async def create_plan(self, *args, progress=None, **kwargs) -> FillActorPlan:
+        del args, kwargs
+        assert progress is not None
+        await progress(
+            JobProgressEvent(
+                stage=JobStage.ACTOR_CATALOG,
+                completed=0,
+                total=2,
+                unit=JobProgressUnit.ACTORS,
+                current='actor-0',
+            )
+        )
+        await progress(
+            JobProgressEvent(
+                stage=JobStage.ACTOR_CATALOG,
+                completed=1,
+                total=2,
+                unit=JobProgressUnit.ACTORS,
+                current='actor-1',
+            )
+        )
+        self.started.set()
+        message = 'simulated plan failure'
+        raise self.failure_type(message)
 
 
 class MutableProgressClock:
@@ -332,6 +431,268 @@ async def test_shutdown_remains_bounded_when_terminal_persistence_fails() -> Non
     await asyncio.wait_for(service.started.wait(), timeout=1)
 
     await asyncio.wait_for(manager.aclose(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_running_user_cancel_waits_for_execution_cleanup_and_worker_stays_available() -> None:
+    repository = MemoryFillActorRepository()
+    service = CancellationAwareService()
+    manager = FillActorJobManager(
+        service=service,
+        repository=repository,
+        max_concurrent_jobs=1,
+        max_active_jobs=2,
+        poll_interval=0.01,
+    )
+    first = await manager.start_plan(['actor-a'])
+    await asyncio.wait_for(service.started.wait(), timeout=1)
+
+    result = await asyncio.wait_for(manager.cancel_plan(first.job_id), timeout=1)
+
+    assert result.outcome is CancelJobOutcome.CANCELLED
+    assert service.cancelled.is_set()
+    cancelled = await repository.get_job(first.job_id)
+    assert cancelled is not None
+    assert cancelled.state is JobState.FAILED
+    assert cancelled.error_code == JOB_CANCELLED_ERROR_CODE
+
+    service.block = False
+    second = await manager.start_plan(['actor-b'])
+    completed = await wait_for_state(repository, second.job_id, {JobState.COMPLETED})
+    await manager.aclose()
+
+    assert completed.state is JobState.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancel_waits_for_one_cleanup_and_clears_progress_timer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = MemoryFillActorRepository()
+    service = DirtyProgressService()
+    manager = FillActorJobManager(
+        service=service,
+        repository=repository,
+        max_concurrent_jobs=1,
+        max_active_jobs=1,
+        poll_interval=0.01,
+        progress_flush_interval=60,
+    )
+    cleanup_started = asyncio.Event()
+    cleanup_release = asyncio.Event()
+    cleanup_cancelled = asyncio.Event()
+    cleanup_calls = 0
+
+    async def blocked_abort(_task, _job) -> None:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        cleanup_started.set()
+        try:
+            await cleanup_release.wait()
+        except asyncio.CancelledError:
+            cleanup_cancelled.set()
+            raise
+        msg = 'simulated cleanup repository failure'
+        raise OSError(msg)
+
+    monkeypatch.setattr(manager, '_abort_feed_warmup', blocked_abort)
+    job = await manager.start_plan(['actor'])
+    await asyncio.wait_for(service.started.wait(), timeout=1)
+    first = asyncio.create_task(manager.cancel_plan(job.job_id))
+    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+    second = asyncio.create_task(manager.cancel_plan(job.job_id))
+    await asyncio.sleep(0.05)
+
+    assert not first.done()
+    assert not second.done()
+    assert not cleanup_cancelled.is_set()
+    assert cleanup_calls == 1
+    assert any(task.get_name() == f'fill-actor-progress-{job.job_id}' for task in asyncio.all_tasks())
+
+    cleanup_release.set()
+    first_result, second_result = await asyncio.gather(first, second)
+    await asyncio.sleep(0)
+    assert {first_result.outcome, second_result.outcome} == {
+        CancelJobOutcome.CANCELLED,
+        CancelJobOutcome.ALREADY_CANCELLED,
+    }
+    assert not cleanup_cancelled.is_set()
+    assert cleanup_calls == 1
+    assert not any(task.get_name() == f'fill-actor-progress-{job.job_id}' for task in asyncio.all_tasks())
+    assert not any(task.get_name() == f'fill-actor-cleanup-{job.job_id}' for task in asyncio.all_tasks())
+    await manager.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure_type', [FillActorError, RuntimeError], ids=['domain-error', 'unexpected-error'])
+async def test_cancel_during_failed_plan_cleanup_waits_and_clears_progress_timer(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[Exception],
+) -> None:
+    repository = MemoryFillActorRepository()
+    service = FailingDirtyProgressService(failure_type)
+    manager = FillActorJobManager(
+        service=service,
+        repository=repository,
+        max_concurrent_jobs=1,
+        max_active_jobs=1,
+        poll_interval=0.01,
+        progress_flush_interval=60,
+    )
+    cleanup_started = asyncio.Event()
+    cleanup_release = asyncio.Event()
+    cleanup_cancelled = asyncio.Event()
+
+    async def blocked_abort(_task, _job) -> None:
+        cleanup_started.set()
+        try:
+            await cleanup_release.wait()
+        except asyncio.CancelledError:
+            cleanup_cancelled.set()
+            raise
+
+    monkeypatch.setattr(manager, '_abort_feed_warmup', blocked_abort)
+    job = await manager.start_plan(['actor'])
+    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+    assert service.started.is_set()
+    assert any(task.get_name() == f'fill-actor-progress-{job.job_id}' for task in asyncio.all_tasks())
+
+    request = asyncio.create_task(manager.cancel_plan(job.job_id))
+    await asyncio.sleep(0.05)
+    completed_before_release = request.done()
+    cleanup_release.set()
+    result = await asyncio.wait_for(request, timeout=1)
+    await asyncio.sleep(0)
+    progress_tasks = [task for task in asyncio.all_tasks() if task.get_name() == f'fill-actor-progress-{job.job_id}']
+    await manager.aclose()
+    for task in progress_tasks:
+        task.cancel()
+    if progress_tasks:
+        await asyncio.gather(*progress_tasks, return_exceptions=True)
+
+    cancelled = await repository.get_job(job.job_id)
+    assert result.outcome is CancelJobOutcome.CANCELLED
+    assert not completed_before_release
+    assert not cleanup_cancelled.is_set()
+    assert not progress_tasks
+    assert cancelled is not None
+    assert cancelled.error_code == JOB_CANCELLED_ERROR_CODE
+
+
+@pytest.mark.asyncio
+async def test_already_cancelled_result_still_signals_local_execution() -> None:
+    repository = MemoryFillActorRepository()
+    service = CancellationAwareService()
+    manager = FillActorJobManager(
+        service=service,
+        repository=repository,
+        max_concurrent_jobs=1,
+        max_active_jobs=1,
+        poll_interval=0.01,
+    )
+    job = await manager.start_plan(['actor'])
+    await asyncio.wait_for(service.started.wait(), timeout=1)
+    persisted = await repository.cancel_job(job_id=job.job_id, now=datetime.now(UTC))
+    assert persisted.outcome is CancelJobOutcome.CANCELLED
+
+    request = asyncio.create_task(manager.cancel_plan(job.job_id))
+    try:
+        result = await asyncio.wait_for(asyncio.shield(request), timeout=0.2)
+        signalled_before_release = service.cancelled.is_set()
+    finally:
+        service.release.set()
+        await asyncio.gather(request, return_exceptions=True)
+        await manager.aclose()
+
+    assert result.outcome is CancelJobOutcome.ALREADY_CANCELLED
+    assert signalled_before_release
+
+
+@pytest.mark.asyncio
+async def test_cancel_in_claim_register_gap_prevents_service_execution() -> None:
+    repository = PausedClaimRepository()
+    service = ControlledService()
+    manager = FillActorJobManager(
+        service=service,
+        repository=repository,
+        max_concurrent_jobs=1,
+        max_active_jobs=1,
+        poll_interval=0.01,
+    )
+    job = await manager.start_plan(['actor'])
+    try:
+        await asyncio.wait_for(repository.claimed.wait(), timeout=1)
+
+        result = await manager.cancel_plan(job.job_id)
+        repository.release_claim.set()
+        await asyncio.sleep(0.05)
+
+        assert result.outcome is CancelJobOutcome.CANCELLED
+        assert not service.started.is_set()
+        cancelled = await repository.get_job(job.job_id)
+        assert cancelled is not None
+        assert cancelled.error_code == JOB_CANCELLED_ERROR_CODE
+    finally:
+        repository.release_claim.set()
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cancel_operation_survives_request_task_cancellation_and_stops_execution() -> None:
+    repository = PausedCancelRepository()
+    service = CancellationAwareService()
+    manager = FillActorJobManager(
+        service=service,
+        repository=repository,
+        max_concurrent_jobs=1,
+        max_active_jobs=1,
+        poll_interval=0.01,
+    )
+    job = await manager.start_plan(['actor'])
+    await asyncio.wait_for(service.started.wait(), timeout=1)
+    request = asyncio.create_task(manager.cancel_plan(job.job_id))
+    await asyncio.wait_for(repository.cancel_persisted.wait(), timeout=1)
+
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    repository.release_cancel.set()
+    await asyncio.wait_for(service.cancelled.wait(), timeout=1)
+    for _ in range(100):
+        if not manager._cancel_operations:  # noqa: SLF001
+            break
+        await asyncio.sleep(0.005)
+    await manager.aclose()
+
+    cancelled = await repository.get_job(job.job_id)
+    assert cancelled is not None
+    assert cancelled.error_code == JOB_CANCELLED_ERROR_CODE
+    assert not manager._cancel_operations  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_stops_execution_after_external_cancellation() -> None:
+    repository = MemoryFillActorRepository()
+    service = CancellationAwareService()
+    manager = FillActorJobManager(
+        service=service,
+        repository=repository,
+        max_concurrent_jobs=1,
+        max_active_jobs=1,
+        lease_duration=timedelta(milliseconds=150),
+        poll_interval=0.01,
+    )
+    job = await manager.start_plan(['actor'])
+    await asyncio.wait_for(service.started.wait(), timeout=1)
+
+    result = await repository.cancel_job(job_id=job.job_id, now=datetime.now(UTC))
+    assert result.outcome is CancelJobOutcome.CANCELLED
+    await asyncio.wait_for(service.cancelled.wait(), timeout=1)
+    await manager.aclose()
+
+    cancelled = await repository.get_job(job.job_id)
+    assert cancelled is not None
+    assert cancelled.error_code == JOB_CANCELLED_ERROR_CODE
 
 
 @pytest.mark.asyncio

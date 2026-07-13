@@ -31,6 +31,7 @@ from embyx_web.fill_actor.feeds import build_freshrss_add_url
 from embyx_web.fill_actor.jobs import FillActorJobManager
 from embyx_web.fill_actor.models import ApplyResult, FillActorPlan
 from embyx_web.fill_actor.persistence import (
+    CancelJobOutcome,
     FillActorRepository,
     JobFeedRecord,
     JobProgress,
@@ -291,6 +292,10 @@ def create_app(  # noqa: C901, PLR0913, PLR0915
         if not await repository.health_check() or not await service.roots_ready():
             raise ApiError(503, 'not_ready')
 
+    async def require_repository_ready() -> None:
+        if not await repository.health_check():
+            raise ApiError(503, 'not_ready')
+
     @app.exception_handler(ApiError)
     async def handle_api_error(_request: Request, exc: ApiError) -> JSONResponse:
         headers = {'WWW-Authenticate': 'Bearer'} if exc.status_code == HTTP_UNAUTHORIZED else None
@@ -342,6 +347,30 @@ def create_app(  # noqa: C901, PLR0913, PLR0915
         return PlanEnvelope(
             job=JobView.from_record(job),
             plan=plan,
+            feeds=tuple(
+                ActorFeedView.from_record(
+                    feed,
+                    freshrss_url=freshrss_url,
+                    freshrss_rsshub_url=freshrss_rsshub_url,
+                )
+                for feed in feeds
+            ),
+        )
+
+    @app.post(
+        '/api/fill-actor/plans/{plan_id}/cancel',
+        dependencies=[Depends(require_mutation_auth), Depends(require_repository_ready)],
+    )
+    async def cancel_plan(plan_id: str) -> PlanEnvelope:
+        result = await jobs.cancel_plan(plan_id)
+        if result.outcome is CancelJobOutcome.NOT_FOUND or result.job is None:
+            raise UnknownPlanError(plan_id)
+        if result.outcome is CancelJobOutcome.ALREADY_TERMINAL:
+            raise ApiError(409, 'plan_not_cancellable')
+        feeds = await jobs.get_feeds(plan_id)
+        return PlanEnvelope(
+            job=JobView.from_record(result.job),
+            plan=None,
             feeds=tuple(
                 ActorFeedView.from_record(
                     feed,

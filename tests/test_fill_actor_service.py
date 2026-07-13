@@ -21,7 +21,14 @@ from embyx_web.fill_actor import (
     UnknownPlanError,
     VideoState,
 )
-from embyx_web.fill_actor.persistence import JobProgressEvent, JobProgressUnit, JobStage
+from embyx_web.fill_actor.jobs import FillActorJobManager
+from embyx_web.fill_actor.persistence import (
+    CancelJobOutcome,
+    JobProgressEvent,
+    JobProgressUnit,
+    JobStage,
+    MemoryFillActorRepository,
+)
 
 
 class FakeActorCatalog:
@@ -122,6 +129,106 @@ def make_service(
         ),
         magnet_provider,
     )
+
+
+@pytest.mark.asyncio
+async def test_managed_scan_cancellation_waits_for_worker_exit_and_wins_worker_error(
+    paths: FillActorPaths,
+) -> None:
+    service, _ = make_service(paths, catalog={'actor': []}, brands={})
+    started = threading.Event()
+    stop_seen = threading.Event()
+    release = threading.Event()
+    exited = threading.Event()
+
+    def blocked_scan(stop_requested: threading.Event) -> tuple[Path, ...]:
+        started.set()
+        if not stop_requested.wait(2):
+            msg = 'scan stop was not delivered'
+            raise AssertionError(msg)
+        stop_seen.set()
+        if not release.wait(2):
+            msg = 'test did not release scan worker'
+            raise AssertionError(msg)
+        exited.set()
+        msg = 'NFS failed while the cancelled scan was unwinding'
+        raise OSError(msg)
+
+    scan = asyncio.create_task(service._run_scan(blocked_scan))  # noqa: SLF001
+    assert await asyncio.to_thread(started.wait, 1)
+    scan.cancel()
+    try:
+        assert await asyncio.to_thread(stop_seen.wait, 1)
+        await asyncio.sleep(0)
+        assert not scan.done()
+    finally:
+        release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(scan, timeout=1)
+    assert exited.is_set()
+    assert not service._scan_futures  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_job_cancel_does_not_return_before_managed_scan_worker_exits(
+    paths: FillActorPaths,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = MemoryFillActorRepository()
+    service = FillActorService(
+        paths=paths,
+        actor_catalog=FakeActorCatalog({'actor': ['ABC-001']}),
+        magnet_provider=FakeMagnetProvider(),
+        brand_resolver=MappingBrandResolver({'ABC-001': 'ABC'}),
+        repository=repository,
+    )
+    manager = FillActorJobManager(
+        service=service,
+        repository=repository,
+        max_concurrent_jobs=1,
+        max_active_jobs=1,
+        poll_interval=0.01,
+    )
+    started = threading.Event()
+    stop_seen = threading.Event()
+    release = threading.Event()
+    exited = threading.Event()
+
+    def blocked_scan(
+        _root: Path,
+        _brand: str,
+        _video_id: str,
+        stop_requested: threading.Event,
+    ) -> tuple[Path, ...]:
+        started.set()
+        if not stop_requested.wait(2):
+            msg = 'scan stop was not delivered'
+            raise AssertionError(msg)
+        stop_seen.set()
+        if not release.wait(2):
+            msg = 'test did not release scan worker'
+            raise AssertionError(msg)
+        exited.set()
+        return ()
+
+    monkeypatch.setattr(service, '_find_matching_files', blocked_scan)
+    job = await manager.start_plan(['actor'])
+    assert await asyncio.to_thread(started.wait, 1)
+    cancel = asyncio.create_task(manager.cancel_plan(job.job_id))
+    try:
+        assert await asyncio.to_thread(stop_seen.wait, 1)
+        await asyncio.sleep(0)
+        assert not cancel.done()
+    finally:
+        release.set()
+
+    result = await asyncio.wait_for(cancel, timeout=1)
+    assert result.outcome is CancelJobOutcome.CANCELLED
+    assert exited.is_set()
+    assert not service._scan_futures  # noqa: SLF001
+    await manager.aclose()
+    await service.aclose()
 
 
 @pytest.mark.asyncio

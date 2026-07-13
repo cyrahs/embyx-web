@@ -3,12 +3,16 @@ import logging
 import secrets
 from collections.abc import Callable, Sequence
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 
 from embyx_web.fill_actor.errors import FillActorError, JobQueueFullError
 from embyx_web.fill_actor.feeds import RSSHubFeedWarmer
 from embyx_web.fill_actor.models import FillActorPlan, VideoState
 from embyx_web.fill_actor.persistence import (
+    CancelJobOutcome,
+    CancelJobResult,
     FillActorRepository,
     JobFeedRecord,
     JobOperation,
@@ -22,6 +26,45 @@ from embyx_web.fill_actor.persistence import (
 from embyx_web.fill_actor.service import FillActorService
 
 LOGGER = logging.getLogger(__name__)
+
+
+class _ExecutionStopReason(StrEnum):
+    USER_CANCEL = 'user_cancel'
+    OWNERSHIP_LOST = 'ownership_lost'
+    SHUTDOWN = 'shutdown'
+
+
+_STOP_REASON_PRIORITY = {
+    _ExecutionStopReason.SHUTDOWN: 0,
+    _ExecutionStopReason.OWNERSHIP_LOST: 1,
+    _ExecutionStopReason.USER_CANCEL: 2,
+}
+
+
+@dataclass
+class _JobExecution:
+    job_id: str
+    task: asyncio.Task[None] | None = None
+    stop_reason: _ExecutionStopReason | None = None
+    cancel_delivered: bool = False
+
+    def attach_task(self, task: asyncio.Task[None]) -> None:
+        self.task = task
+        self._deliver_cancel()
+
+    def request_stop(self, reason: _ExecutionStopReason) -> bool:
+        if self.stop_reason is None or _STOP_REASON_PRIORITY[reason] > _STOP_REASON_PRIORITY[self.stop_reason]:
+            self.stop_reason = reason
+        return self._deliver_cancel()
+
+    def _deliver_cancel(self) -> bool:
+        if self.cancel_delivered or self.stop_reason is None or self.task is None or self.task.done():
+            return False
+        self.cancel_delivered = True
+        if self.task.cancelling() == 0:
+            self.task.cancel()
+            return True
+        return False
 
 
 class _OwnedProgressReporter:
@@ -204,11 +247,15 @@ class FillActorJobManager:
         self._lifecycle_lock = asyncio.Lock()
         self._workers: tuple[asyncio.Task[None], ...] = ()
         self._reaper: asyncio.Task[None] | None = None
+        self._executions: dict[str, _JobExecution] = {}
+        self._cancel_operations: set[asyncio.Task[CancelJobResult]] = set()
+        self._closing = False
 
     async def start(self) -> None:
         async with self._lifecycle_lock:
             if self._workers:
                 return
+            self._closing = False
             await self.recover_interrupted_jobs()
             self._workers = tuple(
                 asyncio.create_task(self._worker_loop(), name=f'fill-actor-worker-{index}')
@@ -261,11 +308,29 @@ class FillActorJobManager:
     async def get_feeds(self, plan_id: str) -> tuple[JobFeedRecord, ...]:
         return await self._repository.list_job_feeds(plan_id)
 
+    async def cancel_plan(self, plan_id: str) -> CancelJobResult:
+        operation = asyncio.create_task(
+            self._cancel_and_signal(plan_id),
+            name=f'fill-actor-cancel-{plan_id}',
+        )
+        self._cancel_operations.add(operation)
+        operation.add_done_callback(self._cancel_operation_done)
+        return await asyncio.shield(operation)
+
     async def recover_interrupted_jobs(self) -> int:
         return await self._repository.fail_expired_jobs(now=self._now(), error_code='job_interrupted')
 
     async def aclose(self) -> None:
         async with self._lifecycle_lock:
+            self._closing = True
+            if self._cancel_operations:
+                await asyncio.gather(*tuple(self._cancel_operations), return_exceptions=True)
+            executions = tuple(self._executions.values())
+            for execution in executions:
+                execution.request_stop(_ExecutionStopReason.SHUTDOWN)
+            execution_tasks = tuple(execution.task for execution in executions if execution.task is not None)
+            if execution_tasks:
+                await asyncio.gather(*execution_tasks, return_exceptions=True)
             tasks = (*self._workers, *((self._reaper,) if self._reaper is not None else ()))
             self._workers = ()
             self._reaper = None
@@ -279,6 +344,8 @@ class FillActorJobManager:
     async def _worker_loop(self) -> None:
         while True:
             try:
+                if self._closing:
+                    return
                 if not await self._service.roots_ready():
                     await asyncio.sleep(self._poll_interval)
                     continue
@@ -289,7 +356,7 @@ class FillActorJobManager:
                     lease_expires_at=now + self._lease_duration,
                 )
                 if job is not None:
-                    await self._run_plan(job)
+                    await self._run_claimed_job(job)
                     continue
                 self._wake.clear()
                 with suppress(TimeoutError):
@@ -300,7 +367,29 @@ class FillActorJobManager:
                 LOGGER.exception('fill-actor worker iteration failed')
                 await asyncio.sleep(self._poll_interval)
 
-    async def _run_plan(self, job: JobRecord) -> None:
+    async def _run_claimed_job(self, job: JobRecord) -> None:
+        execution = _JobExecution(job_id=job.job_id)
+        self._executions[job.job_id] = execution
+        task = asyncio.create_task(
+            self._run_plan(job, execution),
+            name=f'fill-actor-plan-{job.job_id}',
+        )
+        execution.attach_task(task)
+        try:
+            await task
+        except asyncio.CancelledError:
+            if (
+                execution.stop_reason in {_ExecutionStopReason.USER_CANCEL, _ExecutionStopReason.OWNERSHIP_LOST}
+                and asyncio.current_task() is not None
+                and asyncio.current_task().cancelling() == 0
+            ):
+                return
+            raise
+        finally:
+            if self._executions.get(job.job_id) is execution:
+                self._executions.pop(job.job_id, None)
+
+    async def _run_plan(self, job: JobRecord, execution: _JobExecution) -> None:
         reporter = _OwnedProgressReporter(
             repository=self._repository,
             job=job,
@@ -308,40 +397,81 @@ class FillActorJobManager:
             clock=self._now,
             flush_interval=self._progress_flush_interval,
         )
-        heartbeat = asyncio.create_task(self._heartbeat(job, reporter))
+        heartbeat: asyncio.Task[None] | None = None
         feed_task: asyncio.Task[None] | None = None
         try:
+            if not await self._revalidate_claim(job):
+                await reporter.mark_unowned()
+                return
+            heartbeat = asyncio.create_task(self._heartbeat(job, reporter, execution))
             feed_task = await self._start_feed_warmup(job)
             plan = await self._service.create_plan(job.actor_ids, plan_id=job.plan_id, progress=reporter)
             await self._wait_feed_warmup(feed_task, job)
-        except asyncio.CancelledError:
             await self._stop_heartbeat(heartbeat)
-            await asyncio.shield(self._abort_feed_warmup(feed_task, job))
-            await asyncio.shield(self._finish_terminal(reporter, JobState.FAILED, error_code='job_interrupted'))
+            heartbeat = None
+            partial = any(actor.error_code is not None for actor in plan.actors) or any(
+                video.state is VideoState.SCAN_FAILED or bool(video.warnings) for video in plan.videos
+            )
+            saved = await self._finish_terminal(reporter, JobState.PARTIAL_FAILED if partial else JobState.COMPLETED)
+            if not saved:
+                LOGGER.warning(
+                    'plan %s completed after its job lease was lost; retaining it for audited TTL cleanup',
+                    plan.plan_id,
+                )
+        except asyncio.CancelledError:
+            cleanup = asyncio.create_task(
+                self._cleanup_stopped_plan(job, execution, reporter, heartbeat, feed_task),
+                name=f'fill-actor-cleanup-{job.job_id}',
+            )
+            await self._wait_managed_task(cleanup)
+            if execution.stop_reason in {_ExecutionStopReason.USER_CANCEL, _ExecutionStopReason.OWNERSHIP_LOST}:
+                return
             raise
         except FillActorError as exc:
-            await self._stop_heartbeat(heartbeat)
-            await self._abort_feed_warmup(feed_task, job)
-            await self._finish_terminal(reporter, JobState.FAILED, error_code=exc.code)
+            cleanup = asyncio.create_task(
+                self._cleanup_failed_plan(job, reporter, heartbeat, feed_task, error_code=exc.code),
+                name=f'fill-actor-cleanup-{job.job_id}',
+            )
+            await self._wait_managed_task(cleanup)
             return
         except Exception:  # noqa: BLE001
-            await self._stop_heartbeat(heartbeat)
-            await self._abort_feed_warmup(feed_task, job)
-            await self._finish_terminal(reporter, JobState.FAILED, error_code='plan_creation_failed')
+            cleanup = asyncio.create_task(
+                self._cleanup_failed_plan(
+                    job,
+                    reporter,
+                    heartbeat,
+                    feed_task,
+                    error_code='plan_creation_failed',
+                ),
+                name=f'fill-actor-cleanup-{job.job_id}',
+            )
+            await self._wait_managed_task(cleanup)
             return
 
-        await self._stop_heartbeat(heartbeat)
-        partial = any(actor.error_code is not None for actor in plan.actors) or any(
-            video.state is VideoState.SCAN_FAILED or bool(video.warnings) for video in plan.videos
-        )
-        saved = await self._finish_terminal(reporter, JobState.PARTIAL_FAILED if partial else JobState.COMPLETED)
-        if not saved:
-            LOGGER.warning(
-                'plan %s completed after its job lease was lost; retaining it for audited TTL cleanup',
-                plan.plan_id,
-            )
+    async def _revalidate_claim(self, job: JobRecord) -> bool:
+        while True:
+            now = self._now()
+            if job.lease_expires_at is None or job.lease_expires_at <= now:
+                return False
+            try:
+                return await self._repository.renew_owned_job_lease(
+                    job_id=job.job_id,
+                    owner_id=self._owner_id,
+                    now=now,
+                    lease_expires_at=now + self._lease_duration,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception('fill-actor claimed job revalidation failed; retrying')
+                await asyncio.sleep(self._poll_interval)
 
-    async def _heartbeat(self, job: JobRecord, reporter: _OwnedProgressReporter) -> None:
+    async def _heartbeat(
+        self,
+        job: JobRecord,
+        reporter: _OwnedProgressReporter,
+        execution: _JobExecution,
+    ) -> None:
         interval = max(self._lease_duration.total_seconds() / 3, 0.05)
         retry_interval = min(self._poll_interval, interval)
         while True:
@@ -362,9 +492,75 @@ class FillActorJobManager:
                     await asyncio.sleep(retry_interval)
                     continue
                 if not owned:
+                    execution.request_stop(_ExecutionStopReason.OWNERSHIP_LOST)
                     await reporter.mark_unowned()
                     return
                 break
+
+    async def _cancel_and_signal(self, plan_id: str) -> CancelJobResult:
+        started_at = asyncio.get_running_loop().time()
+        execution: _JobExecution | None = None
+        try:
+            result = await self._repository.cancel_job(job_id=plan_id, now=self._now())
+            execution = self._executions.get(plan_id)
+            if (
+                result.outcome in {CancelJobOutcome.CANCELLED, CancelJobOutcome.ALREADY_CANCELLED}
+                and execution is not None
+            ):
+                execution.request_stop(_ExecutionStopReason.USER_CANCEL)
+            if (
+                result.outcome in {CancelJobOutcome.CANCELLED, CancelJobOutcome.ALREADY_CANCELLED}
+                and execution is not None
+                and execution.task is not None
+            ):
+                await asyncio.gather(execution.task, return_exceptions=True)
+            elapsed_ms = round((asyncio.get_running_loop().time() - started_at) * 1000, 1)
+            LOGGER.info(
+                'fill-actor cancellation completed outcome=%s previous_state=%s local_execution=%s '
+                'cleanup_complete=%s elapsed_ms=%s',
+                result.outcome.value,
+                result.previous_state.value if result.previous_state is not None else None,
+                execution is not None,
+                execution is None or execution.task is None or execution.task.done(),
+                elapsed_ms,
+                extra={
+                    'embyx_event': 'fill_actor_cancel_complete',
+                    'embyx_cancel_outcome': result.outcome.value,
+                    'embyx_previous_state': (
+                        result.previous_state.value if result.previous_state is not None else None
+                    ),
+                    'embyx_local_execution': execution is not None,
+                    'embyx_cleanup_complete': execution is None or execution.task is None or execution.task.done(),
+                    'embyx_elapsed_ms': elapsed_ms,
+                },
+            )
+            return result  # noqa: TRY300
+        except Exception:
+            elapsed_ms = round((asyncio.get_running_loop().time() - started_at) * 1000, 1)
+            LOGGER.exception(
+                'fill-actor cancellation failed local_execution=%s cleanup_complete=%s elapsed_ms=%s',
+                execution is not None,
+                execution is None or execution.task is None or execution.task.done(),
+                elapsed_ms,
+                extra={
+                    'embyx_event': 'fill_actor_cancel_failed',
+                    'embyx_local_execution': execution is not None,
+                    'embyx_cleanup_complete': execution is None or execution.task is None or execution.task.done(),
+                    'embyx_elapsed_ms': elapsed_ms,
+                },
+            )
+            raise
+
+    def _cancel_operation_done(self, task: asyncio.Task[CancelJobResult]) -> None:
+        self._cancel_operations.discard(task)
+        if task.cancelled():
+            return
+        exception = task.exception()
+        if exception is not None:
+            LOGGER.error(
+                'fill-actor cancellation operation failed',
+                exc_info=(type(exception), exception, exception.__traceback__),
+            )
 
     async def _start_feed_warmup(self, job: JobRecord) -> asyncio.Task[None] | None:
         if self._feed_warmer is None:
@@ -390,6 +586,55 @@ class FillActorJobManager:
     async def _abort_feed_warmup(self, task: asyncio.Task[None] | None, job: JobRecord) -> None:
         if self._feed_warmer is not None:
             await self._feed_warmer.abort_job(task, job, owner_id=self._owner_id)
+
+    async def _abort_feed_warmup_safely(self, task: asyncio.Task[None] | None, job: JobRecord) -> None:
+        try:
+            await self._abort_feed_warmup(task, job)
+        except Exception:
+            LOGGER.exception('RSSHub feed warm-up cleanup failed')
+
+    async def _cleanup_stopped_plan(
+        self,
+        job: JobRecord,
+        execution: _JobExecution,
+        reporter: _OwnedProgressReporter,
+        heartbeat: asyncio.Task[None] | None,
+        feed_task: asyncio.Task[None] | None,
+    ) -> None:
+        if heartbeat is not None:
+            await self._stop_heartbeat(heartbeat)
+        try:
+            await self._abort_feed_warmup_safely(feed_task, job)
+        finally:
+            if execution.stop_reason in {_ExecutionStopReason.USER_CANCEL, _ExecutionStopReason.OWNERSHIP_LOST}:
+                await reporter.mark_unowned()
+            else:
+                await self._finish_terminal(reporter, JobState.FAILED, error_code='job_interrupted')
+
+    async def _cleanup_failed_plan(
+        self,
+        job: JobRecord,
+        reporter: _OwnedProgressReporter,
+        heartbeat: asyncio.Task[None] | None,
+        feed_task: asyncio.Task[None] | None,
+        *,
+        error_code: str,
+    ) -> None:
+        if heartbeat is not None:
+            await self._stop_heartbeat(heartbeat)
+        try:
+            await self._abort_feed_warmup_safely(feed_task, job)
+        finally:
+            await self._finish_terminal(reporter, JobState.FAILED, error_code=error_code)
+
+    @staticmethod
+    async def _wait_managed_task(task: asyncio.Task[None]) -> None:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+        task.result()
 
     async def _reaper_loop(self) -> None:
         interval = max(self._lease_duration.total_seconds() / 3, self._poll_interval)
