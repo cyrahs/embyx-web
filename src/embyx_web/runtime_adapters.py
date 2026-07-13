@@ -8,7 +8,9 @@ from pathlib import Path
 from types import ModuleType
 from typing import cast
 
-ActorCallable = Callable[[str], Awaitable[Iterable[str]]]
+from embyx_web.fill_actor.ports import PageProgressCallback
+
+ActorCallable = Callable[..., Awaitable[Iterable[str]]]
 MagnetCallable = Callable[[str], Awaitable[str | None]]
 BrandCallable = Callable[[str], str | None]
 CloseCallable = Callable[[], Awaitable[None]]
@@ -17,8 +19,16 @@ CloseCallable = Callable[[], Awaitable[None]]
 @dataclass(frozen=True)
 class CallableActorCatalog:
     function: ActorCallable
+    supports_progress: bool = False
 
-    async def list_video_ids(self, actor_id: str) -> Iterable[str]:
+    async def list_video_ids(
+        self,
+        actor_id: str,
+        *,
+        progress_callback: PageProgressCallback | None = None,
+    ) -> Iterable[str]:
+        if progress_callback is not None and self.supports_progress:
+            return await self.function(actor_id, progress_callback=progress_callback)
         return await self.function(actor_id)
 
 
@@ -61,7 +71,10 @@ def load_runtime_adapters(*, runtime_root: Path, module_name: str) -> RuntimeAda
     resolve_brand = _require_callable(module, 'resolve_brand')
     close = _require_async_callable(module, 'aclose')
     return RuntimeAdapters(
-        actor_catalog=CallableActorCatalog(cast('ActorCallable', list_video_ids)),
+        actor_catalog=CallableActorCatalog(
+            cast('ActorCallable', list_video_ids),
+            supports_progress=_accepts_keyword(list_video_ids, 'progress_callback'),
+        ),
         magnet_provider=CallableMagnetProvider(cast('MagnetCallable', find_magnet)),
         brand_resolver=CallableBrandResolver(cast('BrandCallable', resolve_brand)),
         close_function=cast('CloseCallable', close),
@@ -142,3 +155,16 @@ def _require_async_callable(module: ModuleType, name: str) -> Callable[..., obje
         msg = f'embyx runtime compatibility callable {name} must be async'
         raise TypeError(msg)
     return function
+
+
+def _accepts_keyword(function: Callable[..., object], name: str) -> bool:
+    parameters = inspect.signature(function).parameters
+    parameter = parameters.get(name)
+    return (
+        parameter is not None
+        and parameter.kind
+        in {
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }
+    ) or any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())

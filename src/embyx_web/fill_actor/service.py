@@ -2,11 +2,12 @@ import asyncio
 import ctypes
 import errno
 import hashlib
+import inspect
 import os
 import re
 import secrets
 from collections import Counter
-from collections.abc import AsyncIterator, Callable, Iterable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -38,6 +39,9 @@ from embyx_web.fill_actor.persistence import (
     CandidateRecord,
     FileFingerprint,
     FillActorRepository,
+    JobProgressEvent,
+    JobProgressUnit,
+    JobStage,
     MemoryFillActorRepository,
     MoveJournalRecord,
     MoveJournalState,
@@ -49,6 +53,7 @@ from embyx_web.locking import AsyncFileLock
 ACTOR_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,32}$')
 DATED_VIDEO_ID_RE = re.compile(r'^(.+)_\d{4}-\d{2}-\d{2}$')
 MAX_MAGNET_LENGTH = 8192
+ProgressCallback = Callable[[JobProgressEvent], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -185,38 +190,105 @@ class FillActorService:
         self._mutation_futures: set[Future[MoveResult]] = set()
         self._apply_lock = asyncio.Lock()
 
-    async def create_plan(
+    async def create_plan(  # noqa: C901, PLR0915
         self,
         actor_ids: Sequence[str],
         *,
         plan_id: str | None = None,
         revision: str | None = None,
+        progress: ProgressCallback | None = None,
     ) -> FillActorPlan:
         normalized_actor_ids = self._validate_actor_ids(actor_ids)
         actor_plans: list[ActorPlan] = []
         video_actors: dict[str, set[str]] = {}
+        actor_total = len(normalized_actor_ids)
 
-        for actor_id in normalized_actor_ids:
+        await self._report_progress(
+            progress,
+            JobProgressEvent(
+                stage=JobStage.ACTOR_CATALOG,
+                completed=0,
+                total=actor_total,
+                unit=JobProgressUnit.ACTORS,
+                current=f'演员 1/{actor_total}',
+            ),
+        )
+
+        for actor_index, actor_id in enumerate(normalized_actor_ids, start=1):
+
+            async def report_page(
+                page_completed: int,
+                page_total: int | None,
+                current_page: int | None,
+                *,
+                _actor_index: int = actor_index,
+                _actor_id: str = actor_id,
+            ) -> None:
+                if current_page is not None:
+                    page = f'页面 {current_page}/{page_total}' if page_total is not None else f'页面 {current_page}'
+                elif page_total is not None:
+                    page = f'已发现 {page_total} 页'
+                elif page_completed:
+                    page = f'已完成 {page_completed} 页'
+                else:
+                    page = '正在发现页面'
+                await self._report_progress(
+                    progress,
+                    JobProgressEvent(
+                        stage=JobStage.ACTOR_CATALOG,
+                        completed=page_completed,
+                        total=page_total,
+                        unit=JobProgressUnit.PAGES,
+                        current=f'演员 {_actor_index}/{actor_total} · {_actor_id} · {page}',
+                    ),
+                )
+
             try:
-                raw_video_ids = tuple(await self._actor_catalog.list_video_ids(actor_id))
+                list_video_ids = self._actor_catalog.list_video_ids
+                if self._accepts_keyword(list_video_ids, 'progress_callback'):
+                    raw_video_ids = tuple(await list_video_ids(actor_id, progress_callback=report_page))
+                else:
+                    raw_video_ids = tuple(await list_video_ids(actor_id))
             except Exception:  # noqa: BLE001
                 actor_plans.append(ActorPlan(actor_id=actor_id, scraped_count=0, error_code='actor_catalog_error'))
-                continue
-
-            video_ids = sorted({self._normalize_video_id(video_id) for video_id in raw_video_ids if video_id.strip()})
-            actor_plans.append(
-                ActorPlan(actor_id=actor_id, scraped_count=len(set(raw_video_ids)), video_ids=tuple(video_ids))
+            else:
+                video_ids = sorted(
+                    {self._normalize_video_id(video_id) for video_id in raw_video_ids if video_id.strip()}
+                )
+                actor_plans.append(
+                    ActorPlan(actor_id=actor_id, scraped_count=len(set(raw_video_ids)), video_ids=tuple(video_ids))
+                )
+                for video_id in video_ids:
+                    video_actors.setdefault(video_id, set()).add(actor_id)
+                if len(video_actors) > self._max_videos:
+                    raise TooManyVideosError(str(len(video_actors)))
+            await self._report_progress(
+                progress,
+                JobProgressEvent(
+                    stage=JobStage.ACTOR_CATALOG,
+                    completed=actor_index,
+                    total=actor_total,
+                    unit=JobProgressUnit.ACTORS,
+                    current=f'演员 {actor_index}/{actor_total} · {actor_id}',
+                ),
             )
-            for video_id in video_ids:
-                video_actors.setdefault(video_id, set()).add(actor_id)
-            if len(video_actors) > self._max_videos:
-                raise TooManyVideosError(str(len(video_actors)))
 
         public_videos: dict[str, VideoPlan] = {}
         records: dict[str, _MoveRecord] = {}
         magnet_video_ids: list[str] = []
+        video_total = len(video_actors)
 
-        for video_id in sorted(video_actors):
+        await self._report_progress(
+            progress,
+            JobProgressEvent(
+                stage=JobStage.LIBRARY_SCAN,
+                completed=0,
+                total=video_total,
+                unit=JobProgressUnit.VIDEOS,
+            ),
+        )
+
+        for video_index, video_id in enumerate(sorted(video_actors), start=1):
             actor_membership = tuple(sorted(video_actors[video_id]))
             try:
                 video_plan, video_records, needs_magnet = await self._create_video_plan(
@@ -230,14 +302,34 @@ class FillActorService:
                     state=VideoState.SCAN_FAILED,
                     warnings=('scan_failed',),
                 )
-                continue
-            public_videos[video_id] = video_plan
-            records.update({record.candidate_id: record for record in video_records})
-            if needs_magnet:
-                magnet_video_ids.append(video_id)
+            else:
+                public_videos[video_id] = video_plan
+                records.update({record.candidate_id: record for record in video_records})
+                if needs_magnet:
+                    magnet_video_ids.append(video_id)
+            await self._report_progress(
+                progress,
+                JobProgressEvent(
+                    stage=JobStage.LIBRARY_SCAN,
+                    completed=video_index,
+                    total=video_total,
+                    unit=JobProgressUnit.VIDEOS,
+                    current=video_id,
+                ),
+            )
 
         self._mark_duplicate_destination_conflicts(public_videos, records)
-        magnet_results = await self._find_magnets(magnet_video_ids)
+        magnet_total = len(magnet_video_ids)
+        await self._report_progress(
+            progress,
+            JobProgressEvent(
+                stage=JobStage.MAGNET_LOOKUP,
+                completed=0,
+                total=magnet_total,
+                unit=JobProgressUnit.MAGNETS,
+            ),
+        )
+        magnet_results = await self._find_magnets(magnet_video_ids, progress=progress)
         for video_id, magnet, warning in magnet_results:
             current = public_videos[video_id]
             public_videos[video_id] = current.model_copy(
@@ -259,7 +351,27 @@ class FillActorService:
             actors=tuple(actor_plans),
             videos=tuple(public_videos[video_id] for video_id in sorted(public_videos)),
         )
+        await self._report_progress(
+            progress,
+            JobProgressEvent(
+                stage=JobStage.PERSISTING,
+                completed=0,
+                total=1,
+                unit=JobProgressUnit.STEPS,
+                current='保存扫描结果',
+            ),
+        )
         await self._repository.save_plan(PlanRecord(public=plan, candidates=tuple(records.values())))
+        await self._report_progress(
+            progress,
+            JobProgressEvent(
+                stage=JobStage.PERSISTING,
+                completed=1,
+                total=1,
+                unit=JobProgressUnit.STEPS,
+                current='扫描结果已保存',
+            ),
+        )
         return plan
 
     def validate_actor_ids(self, actor_ids: Sequence[str]) -> tuple[str, ...]:
@@ -448,7 +560,12 @@ class FillActorService:
             if updated_candidates:
                 videos[video_id] = video.model_copy(update={'move_candidates': updated_candidates})
 
-    async def _find_magnets(self, video_ids: Sequence[str]) -> list[tuple[str, str | None, str | None]]:
+    async def _find_magnets(
+        self,
+        video_ids: Sequence[str],
+        *,
+        progress: ProgressCallback | None = None,
+    ) -> list[tuple[str, str | None, str | None]]:
         async def find(video_id: str) -> tuple[str, str | None, str | None]:
             async with self._magnet_semaphore:
                 try:
@@ -463,18 +580,51 @@ class FillActorService:
         for video_id in video_ids:
             queue.put_nowait(video_id)
         results: dict[str, tuple[str, str | None, str | None]] = {}
+        progress_lock = asyncio.Lock()
+        completed = 0
 
         async def worker() -> None:
+            nonlocal completed
             while True:
                 try:
                     video_id = queue.get_nowait()
                 except asyncio.QueueEmpty:
                     return
                 results[video_id] = await find(video_id)
+                async with progress_lock:
+                    completed += 1
+                    await self._report_progress(
+                        progress,
+                        JobProgressEvent(
+                            stage=JobStage.MAGNET_LOOKUP,
+                            completed=completed,
+                            total=len(video_ids),
+                            unit=JobProgressUnit.MAGNETS,
+                            current=video_id,
+                        ),
+                    )
 
         worker_count = min(self._magnet_concurrency, len(video_ids))
         await asyncio.gather(*(worker() for _ in range(worker_count)))
         return [results[video_id] for video_id in video_ids]
+
+    @staticmethod
+    async def _report_progress(progress: ProgressCallback | None, event: JobProgressEvent) -> None:
+        if progress is not None:
+            await progress(event)
+
+    @staticmethod
+    def _accepts_keyword(function: Callable[..., object], name: str) -> bool:
+        parameters = inspect.signature(function).parameters
+        parameter = parameters.get(name)
+        return (
+            parameter is not None
+            and parameter.kind
+            in {
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            }
+        ) or any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
 
     async def get_plan(self, plan_id: str) -> FillActorPlan:
         return (await self._get_plan(plan_id)).public

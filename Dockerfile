@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-ARG EMBYX_RUNTIME_IMAGE=ghcr.io/cyrahs/embyx@sha256:4dd9c47c9107590792d488ea988a03a8f7a6ed78f8c4e38e51b339e69fb4fb70
+ARG EMBYX_RUNTIME_IMAGE=ghcr.io/cyrahs/embyx@sha256:1090fc71467edb28a8db3b3e54cca7b161b97e593a5ddaa58235d39f5384f978
 
 FROM node:22-bookworm-slim AS frontend-build
 

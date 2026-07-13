@@ -1,11 +1,18 @@
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import Protocol
+
+PageProgressCallback = Callable[[int, int | None, int | None], Awaitable[None]]
 
 
 class ActorCatalog(Protocol):
     """Source that lists video identifiers associated with an actor."""
 
-    async def list_video_ids(self, actor_id: str) -> Iterable[str]: ...
+    async def list_video_ids(
+        self,
+        actor_id: str,
+        *,
+        progress_callback: PageProgressCallback | None = None,
+    ) -> Iterable[str]: ...
 
 
 class MagnetProvider(Protocol):

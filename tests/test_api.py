@@ -1,14 +1,21 @@
 import asyncio
 import threading
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from embyx_web.api import create_app
+from embyx_web.api import JobProgressView, create_app
 from embyx_web.fill_actor.jobs import FillActorJobManager
-from embyx_web.fill_actor.persistence import MemoryFillActorRepository
+from embyx_web.fill_actor.persistence import (
+    JobProgress,
+    JobProgressUnit,
+    JobStage,
+    JobState,
+    MemoryFillActorRepository,
+)
 from embyx_web.fill_actor.service import FillActorPaths, FillActorService
 
 
@@ -91,9 +98,14 @@ def test_plan_job_and_apply_end_to_end(tmp_path: Path) -> None:
     with client:
         response = client.post('/api/fill-actor/plans', json={'actor_ids': ['actor']})
         assert response.status_code == 202
+        assert response.headers['cache-control'] == 'no-store'
+        assert response.json()['job']['progress']['stage'] == 'queued'
+        assert response.json()['job']['progress']['total'] == 1
         plan_id = response.json()['job']['plan_id']
         payload = wait_for_plan(client, plan_id)
         assert payload['job']['state'] == 'completed'
+        assert payload['job']['progress']['stage'] == 'done'
+        assert payload['job']['progress']['eta_seconds'] == 0
         candidate = payload['plan']['videos'][0]['move_candidates'][0]
 
         applied = client.post(
@@ -194,3 +206,25 @@ def test_completed_job_without_plan_returns_not_found(tmp_path: Path) -> None:
 
     assert missing.status_code == 404
     assert missing.json() == {'error': {'code': 'unknown_plan'}}
+
+
+def test_job_progress_view_derives_stage_eta_and_activity_ages() -> None:
+    started = datetime(2026, 7, 13, 10, 0, tzinfo=UTC)
+    view = JobProgressView.from_record(
+        JobProgress(
+            stage=JobStage.LIBRARY_SCAN,
+            completed=4,
+            total=10,
+            unit=JobProgressUnit.VIDEOS,
+            current='ABC-004',
+            stage_started_at=started,
+            updated_at=started + timedelta(seconds=30),
+        ),
+        state=JobState.RUNNING,
+        now=started + timedelta(seconds=40),
+    )
+
+    assert view.percent == 40.0
+    assert view.eta_seconds == 60
+    assert view.elapsed_seconds == 40
+    assert view.last_progress_seconds == 10

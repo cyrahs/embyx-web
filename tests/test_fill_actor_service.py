@@ -21,6 +21,7 @@ from embyx_web.fill_actor import (
     UnknownPlanError,
     VideoState,
 )
+from embyx_web.fill_actor.persistence import JobProgressEvent, JobProgressUnit, JobStage
 
 
 class FakeActorCatalog:
@@ -32,6 +33,16 @@ class FakeActorCatalog:
         if isinstance(value, Exception):
             raise value
         return value
+
+
+class PageProgressActorCatalog:
+    async def list_video_ids(self, _actor_id: str, *, progress_callback=None) -> list[str]:
+        assert progress_callback is not None
+        await progress_callback(0, None, None)
+        await progress_callback(0, 26, None)
+        await progress_callback(1, 26, 1)
+        await progress_callback(26, 26, 26)
+        return ['ABC-001', 'ABC-002']
 
 
 class FakeMagnetProvider:
@@ -111,6 +122,68 @@ def make_service(
         ),
         magnet_provider,
     )
+
+
+@pytest.mark.asyncio
+async def test_create_plan_reports_durable_stage_and_page_progress(paths: FillActorPaths) -> None:
+    events: list[JobProgressEvent] = []
+    service = FillActorService(
+        paths=paths,
+        actor_catalog=PageProgressActorCatalog(),
+        magnet_provider=FakeMagnetProvider({'ABC-001': None, 'ABC-002': None}),
+        brand_resolver=MappingBrandResolver({'ABC-001': 'ABC', 'ABC-002': 'ABC'}),
+        token_factory=TokenFactory(),
+    )
+
+    async def report(event: JobProgressEvent) -> None:
+        events.append(event)
+
+    await service.create_plan(['actor'], progress=report)
+
+    transitions: list[JobStage] = []
+    for event in events:
+        if not transitions or event.stage is not transitions[-1]:
+            transitions.append(event.stage)
+    assert transitions == [
+        JobStage.ACTOR_CATALOG,
+        JobStage.LIBRARY_SCAN,
+        JobStage.MAGNET_LOOKUP,
+        JobStage.PERSISTING,
+    ]
+    assert events[0].stage is JobStage.ACTOR_CATALOG
+    page_events = [event for event in events if event.unit is JobProgressUnit.PAGES]
+    assert [(event.completed, event.total) for event in page_events] == [
+        (0, None),
+        (0, 26),
+        (1, 26),
+        (26, 26),
+    ]
+    assert page_events[2].current is not None
+    assert '页面 1/26' in page_events[2].current
+    assert page_events[3].current is not None
+    assert '页面 26/26' in page_events[3].current
+    actor_events = [
+        event for event in events if event.stage is JobStage.ACTOR_CATALOG and event.unit is JobProgressUnit.ACTORS
+    ]
+    assert actor_events[-1].completed == actor_events[-1].total == 1
+    assert [
+        (event.stage, event.completed, event.total) for event in events if event.stage is JobStage.LIBRARY_SCAN
+    ] == [
+        (JobStage.LIBRARY_SCAN, 0, 2),
+        (JobStage.LIBRARY_SCAN, 1, 2),
+        (JobStage.LIBRARY_SCAN, 2, 2),
+    ]
+    assert [
+        (event.stage, event.completed, event.total) for event in events if event.stage is JobStage.MAGNET_LOOKUP
+    ] == [
+        (JobStage.MAGNET_LOOKUP, 0, 2),
+        (JobStage.MAGNET_LOOKUP, 1, 2),
+        (JobStage.MAGNET_LOOKUP, 2, 2),
+    ]
+    assert [(event.stage, event.completed, event.total) for event in events[-2:]] == [
+        (JobStage.PERSISTING, 0, 1),
+        (JobStage.PERSISTING, 1, 1),
+    ]
 
 
 @pytest.mark.asyncio

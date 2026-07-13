@@ -44,6 +44,41 @@ async def aclose():
     assert module.closed is True
 
 
+@pytest.mark.asyncio
+async def test_runtime_actor_adapter_forwards_optional_page_progress(tmp_path: Path) -> None:
+    package = tmp_path / 'progress_runtime'
+    package.mkdir()
+    (package / '__init__.py').write_text('', encoding='utf-8')
+    (package / 'fill_actor_api.py').write_text(
+        """
+async def list_actor_video_ids(actor_id, *, progress_callback=None):
+    if progress_callback is not None:
+        await progress_callback(0, 2, None)
+        await progress_callback(1, 2, 1)
+        await progress_callback(2, 2, 2)
+    return [f'{actor_id}-001']
+
+def resolve_brand(video_id):
+    return video_id.split('-', 1)[0]
+
+async def find_sukebei_magnet(_video_id):
+    return None
+
+async def aclose():
+    return None
+""",
+        encoding='utf-8',
+    )
+    adapters = load_runtime_adapters(runtime_root=tmp_path, module_name='progress_runtime.fill_actor_api')
+    events: list[tuple[int, int | None, int | None]] = []
+
+    async def report(completed: int, total: int | None, current: int | None) -> None:
+        events.append((completed, total, current))
+
+    assert tuple(await adapters.actor_catalog.list_video_ids('ABC', progress_callback=report)) == ('ABC-001',)
+    assert events == [(0, 2, None), (1, 2, 1), (2, 2, 2)]
+
+
 def test_rejects_runtime_module_loaded_outside_configured_root(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match='outside'):
         load_runtime_adapters(runtime_root=tmp_path, module_name='embyx_web.fill_actor.models')

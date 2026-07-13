@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager, suppress
@@ -9,7 +10,7 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
@@ -28,7 +29,7 @@ from embyx_web.fill_actor.errors import (
 )
 from embyx_web.fill_actor.jobs import FillActorJobManager
 from embyx_web.fill_actor.models import ApplyResult, FillActorPlan
-from embyx_web.fill_actor.persistence import FillActorRepository, JobRecord, JobState
+from embyx_web.fill_actor.persistence import FillActorRepository, JobProgress, JobRecord, JobStage, JobState
 from embyx_web.fill_actor.service import FillActorService
 
 HTTP_UNAUTHORIZED = 401
@@ -48,6 +49,55 @@ class ApplyPlanRequest(BaseModel):
     candidate_ids: list[str] = Field(default_factory=list, max_length=5_000)
 
 
+class JobProgressView(BaseModel):
+    stage: str
+    completed: int
+    total: int | None
+    unit: str
+    current: str | None
+    stage_started_at: datetime
+    updated_at: datetime
+    percent: float | None
+    eta_seconds: int | None
+    elapsed_seconds: int
+    last_progress_seconds: int
+
+    @classmethod
+    def from_record(cls, progress: JobProgress, *, state: JobState, now: datetime) -> 'JobProgressView':
+        elapsed_seconds = max(0, math.floor((now - progress.stage_started_at).total_seconds()))
+        last_progress_seconds = max(0, math.floor((now - progress.updated_at).total_seconds()))
+        if progress.total is None:
+            percent = None
+        elif progress.total == 0:
+            percent = 100.0
+        else:
+            percent = round(min(progress.completed / progress.total * 100, 100.0), 2)
+
+        if progress.stage is JobStage.DONE or state not in {JobState.QUEUED, JobState.RUNNING}:
+            eta_seconds = 0
+        elif progress.total is None or progress.completed == 0:
+            eta_seconds = None
+        elif progress.completed >= progress.total:
+            eta_seconds = 0
+        elif elapsed_seconds == 0:
+            eta_seconds = None
+        else:
+            eta_seconds = math.ceil(elapsed_seconds / progress.completed * (progress.total - progress.completed))
+        return cls(
+            stage=progress.stage.value,
+            completed=progress.completed,
+            total=progress.total,
+            unit=progress.unit.value,
+            current=progress.current,
+            stage_started_at=progress.stage_started_at,
+            updated_at=progress.updated_at,
+            percent=percent,
+            eta_seconds=eta_seconds,
+            elapsed_seconds=elapsed_seconds,
+            last_progress_seconds=last_progress_seconds,
+        )
+
+
 class JobView(BaseModel):
     job_id: str
     plan_id: str | None
@@ -56,9 +106,14 @@ class JobView(BaseModel):
     created_at: datetime
     updated_at: datetime
     error_code: str | None
+    progress: JobProgressView
 
     @classmethod
     def from_record(cls, record: JobRecord) -> 'JobView':
+        if record.progress is None:  # pragma: no cover - JobRecord normalizes this invariant
+            msg = 'job progress is required'
+            raise ValueError(msg)
+        now = datetime.now(UTC)
         return cls(
             job_id=record.job_id,
             plan_id=record.plan_id,
@@ -67,6 +122,7 @@ class JobView(BaseModel):
             created_at=record.created_at,
             updated_at=record.updated_at,
             error_code=record.error_code,
+            progress=JobProgressView.from_record(record.progress, state=record.state, now=now),
         )
 
 
@@ -165,6 +221,16 @@ def create_app(  # noqa: C901, PLR0913, PLR0915
     app = FastAPI(title='embyx-web', version='0.2.0', lifespan=lifespan)
     app.add_middleware(RequestSizeLimitMiddleware, max_bytes=max_request_bytes)
     bearer = HTTPBearer(auto_error=False)
+
+    @app.middleware('http')
+    async def add_api_cache_control(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        response = await call_next(request)
+        if request.url.path.startswith('/api/'):
+            response.headers['Cache-Control'] = 'no-store'
+        return response
 
     async def require_mutation_auth(
         credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],

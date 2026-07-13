@@ -11,7 +11,10 @@ from embyx_web.fill_actor.persistence import (
     CandidateRecord,
     FileFingerprint,
     JobOperation,
+    JobProgress,
+    JobProgressUnit,
     JobRecord,
+    JobStage,
     JobState,
     MoveJournalRecord,
     MoveJournalState,
@@ -20,7 +23,7 @@ from embyx_web.fill_actor.persistence import (
     validate_journal_transition,
 )
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 async def _run_sync[ResultT](function: Callable[..., ResultT], *args: object) -> ResultT:
@@ -114,6 +117,38 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
         'CREATE INDEX jobs_lease_idx ON jobs (state, lease_expires_at)',
         'CREATE TABLE health_probe (id INTEGER PRIMARY KEY CHECK (id = 1), checked_at TEXT NOT NULL)',
     ),
+    3: (
+        """
+        ALTER TABLE jobs ADD COLUMN progress_stage TEXT NOT NULL DEFAULT 'queued'
+        CHECK (progress_stage IN (
+            'queued', 'actor_catalog', 'library_scan', 'magnet_lookup', 'persisting', 'done', 'unknown'
+        ))
+        """,
+        'ALTER TABLE jobs ADD COLUMN progress_completed INTEGER NOT NULL DEFAULT 0 CHECK (progress_completed >= 0)',
+        'ALTER TABLE jobs ADD COLUMN progress_total INTEGER CHECK (progress_total IS NULL OR progress_total >= 0)',
+        """
+        ALTER TABLE jobs ADD COLUMN progress_unit TEXT NOT NULL DEFAULT 'items'
+        CHECK (progress_unit IN ('actors', 'pages', 'videos', 'magnets', 'steps', 'items'))
+        """,
+        'ALTER TABLE jobs ADD COLUMN progress_current TEXT',
+        "ALTER TABLE jobs ADD COLUMN progress_stage_started_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00'",
+        "ALTER TABLE jobs ADD COLUMN progress_updated_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00'",
+        """
+        UPDATE jobs SET
+            progress_stage = CASE
+                WHEN state = 'queued' THEN 'queued'
+                WHEN state = 'running' THEN 'unknown'
+                ELSE 'done'
+            END,
+            progress_total = CASE
+                WHEN state = 'queued' THEN json_array_length(actor_ids_json)
+                ELSE NULL
+            END,
+            progress_unit = CASE WHEN state = 'queued' THEN 'actors' ELSE 'items' END,
+            progress_stage_started_at = created_at,
+            progress_updated_at = updated_at
+        """,
+    ),
 }
 
 
@@ -162,14 +197,37 @@ class SQLiteFillActorRepository:
     ) -> JobRecord | None:
         return await _run_sync(self._claim_next_job, owner_id, now, lease_expires_at)
 
-    async def update_owned_job(
+    async def renew_owned_job_lease(
         self,
-        record: JobRecord,
         *,
+        job_id: str,
         owner_id: str,
-        expected_states: Sequence[JobState],
+        now: datetime,
+        lease_expires_at: datetime,
     ) -> bool:
-        return await _run_sync(self._update_owned_job, record, owner_id, expected_states)
+        return await _run_sync(self._renew_owned_job_lease, job_id, owner_id, now, lease_expires_at)
+
+    async def update_owned_job_progress(
+        self,
+        *,
+        job_id: str,
+        owner_id: str,
+        progress: JobProgress,
+        now: datetime,
+    ) -> bool:
+        return await _run_sync(self._update_owned_job_progress, job_id, owner_id, progress, now)
+
+    async def finish_owned_job(  # noqa: PLR0913
+        self,
+        *,
+        job_id: str,
+        owner_id: str,
+        state: JobState,
+        error_code: str | None,
+        now: datetime,
+        progress: JobProgress,
+    ) -> bool:
+        return await _run_sync(self._finish_owned_job, job_id, owner_id, state, error_code, now, progress)
 
     async def fail_expired_jobs(self, *, now: datetime, error_code: str) -> int:
         return await _run_sync(self._fail_expired_jobs, now, error_code)
@@ -445,38 +503,80 @@ class SQLiteFillActorRepository:
                 owner_id=owner_id,
                 lease_expires_at=lease_expires_at,
                 actor_ids=tuple(json.loads(row['actor_ids_json'])),
+                progress=_progress_from_row(row),
             )
 
-    def _update_owned_job(
+    def _renew_owned_job_lease(
         self,
-        record: JobRecord,
+        job_id: str,
         owner_id: str,
-        expected_states: Sequence[JobState],
+        now: datetime,
+        lease_expires_at: datetime,
     ) -> bool:
-        if not expected_states:
-            return False
-        placeholders = ', '.join('?' for _ in expected_states)
         with closing(self._connect()) as connection, connection:
             cursor = connection.execute(
-                f"""
-                UPDATE jobs SET
-                    operation = ?, state = ?, created_at = ?, updated_at = ?, plan_id = ?, error_code = ?,
-                    owner_id = ?, lease_expires_at = ?, actor_ids_json = ?
-                WHERE job_id = ? AND owner_id = ? AND state IN ({placeholders})
-                """,  # noqa: S608
+                """
+                UPDATE jobs SET updated_at = ?, lease_expires_at = ?
+                WHERE job_id = ? AND owner_id = ? AND state = 'running'
+                  AND lease_expires_at IS NOT NULL AND lease_expires_at > ?
+                """,
                 (
-                    record.operation.value,
-                    record.state.value,
-                    _datetime_to_text(record.created_at),
-                    _datetime_to_text(record.updated_at),
-                    record.plan_id,
-                    record.error_code,
-                    record.owner_id,
-                    _datetime_to_text(record.lease_expires_at) if record.lease_expires_at is not None else None,
-                    json.dumps(record.actor_ids),
-                    record.job_id,
+                    _datetime_to_text(now),
+                    _datetime_to_text(lease_expires_at),
+                    job_id,
                     owner_id,
-                    *(state.value for state in expected_states),
+                    _datetime_to_text(now),
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def _update_owned_job_progress(
+        self,
+        job_id: str,
+        owner_id: str,
+        progress: JobProgress,
+        now: datetime,
+    ) -> bool:
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                """
+                UPDATE jobs SET
+                    progress_stage = ?, progress_completed = ?, progress_total = ?, progress_unit = ?,
+                    progress_current = ?, progress_stage_started_at = ?, progress_updated_at = ?
+                WHERE job_id = ? AND owner_id = ? AND state = 'running'
+                  AND lease_expires_at IS NOT NULL AND lease_expires_at > ?
+                """,
+                (*_progress_values(progress), job_id, owner_id, _datetime_to_text(now)),
+            )
+            return cursor.rowcount == 1
+
+    def _finish_owned_job(  # noqa: PLR0913
+        self,
+        job_id: str,
+        owner_id: str,
+        state: JobState,
+        error_code: str | None,
+        now: datetime,
+        progress: JobProgress,
+    ) -> bool:
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                """
+                UPDATE jobs SET
+                    state = ?, updated_at = ?, error_code = ?, owner_id = NULL, lease_expires_at = NULL,
+                    progress_stage = ?, progress_completed = ?, progress_total = ?, progress_unit = ?,
+                    progress_current = ?, progress_stage_started_at = ?, progress_updated_at = ?
+                WHERE job_id = ? AND owner_id = ? AND state = 'running'
+                  AND lease_expires_at IS NOT NULL AND lease_expires_at > ?
+                """,
+                (
+                    state.value,
+                    _datetime_to_text(now),
+                    error_code,
+                    *_progress_values(progress),
+                    job_id,
+                    owner_id,
+                    _datetime_to_text(now),
                 ),
             )
             return cursor.rowcount == 1
@@ -486,10 +586,17 @@ class SQLiteFillActorRepository:
             cursor = connection.execute(
                 """
                 UPDATE jobs
-                SET state = 'failed', updated_at = ?, error_code = ?, owner_id = NULL, lease_expires_at = NULL
+                SET state = 'failed', updated_at = ?, error_code = ?, owner_id = NULL, lease_expires_at = NULL,
+                    progress_stage = 'done', progress_stage_started_at = ?, progress_updated_at = ?
                 WHERE state = 'running' AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
                 """,
-                (_datetime_to_text(now), error_code, _datetime_to_text(now)),
+                (
+                    _datetime_to_text(now),
+                    error_code,
+                    _datetime_to_text(now),
+                    _datetime_to_text(now),
+                    _datetime_to_text(now),
+                ),
             )
             return cursor.rowcount
 
@@ -499,9 +606,11 @@ class SQLiteFillActorRepository:
             """
                 INSERT INTO jobs (
                     job_id, operation, state, created_at, updated_at, plan_id, error_code,
-                    owner_id, lease_expires_at, actor_ids_json
+                    owner_id, lease_expires_at, actor_ids_json,
+                    progress_stage, progress_completed, progress_total, progress_unit, progress_current,
+                    progress_stage_started_at, progress_updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (job_id) DO UPDATE SET
                     operation = excluded.operation,
                     state = excluded.state,
@@ -511,7 +620,14 @@ class SQLiteFillActorRepository:
                     error_code = excluded.error_code,
                     owner_id = excluded.owner_id,
                     lease_expires_at = excluded.lease_expires_at,
-                    actor_ids_json = excluded.actor_ids_json
+                    actor_ids_json = excluded.actor_ids_json,
+                    progress_stage = excluded.progress_stage,
+                    progress_completed = excluded.progress_completed,
+                    progress_total = excluded.progress_total,
+                    progress_unit = excluded.progress_unit,
+                    progress_current = excluded.progress_current,
+                    progress_stage_started_at = excluded.progress_stage_started_at,
+                    progress_updated_at = excluded.progress_updated_at
                 """,
             (
                 record.job_id,
@@ -524,6 +640,7 @@ class SQLiteFillActorRepository:
                 record.owner_id,
                 _datetime_to_text(record.lease_expires_at) if record.lease_expires_at is not None else None,
                 json.dumps(record.actor_ids),
+                *_progress_values(_require_progress(record)),
             ),
         )
 
@@ -648,7 +765,39 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
         owner_id=row['owner_id'],
         lease_expires_at=datetime.fromisoformat(row['lease_expires_at']) if row['lease_expires_at'] else None,
         actor_ids=tuple(json.loads(row['actor_ids_json'])),
+        progress=_progress_from_row(row),
     )
+
+
+def _progress_from_row(row: sqlite3.Row) -> JobProgress:
+    return JobProgress(
+        stage=JobStage(row['progress_stage']),
+        completed=row['progress_completed'],
+        total=row['progress_total'],
+        unit=JobProgressUnit(row['progress_unit']),
+        current=row['progress_current'],
+        stage_started_at=datetime.fromisoformat(row['progress_stage_started_at']),
+        updated_at=datetime.fromisoformat(row['progress_updated_at']),
+    )
+
+
+def _progress_values(progress: JobProgress) -> tuple[object, ...]:
+    return (
+        progress.stage.value,
+        progress.completed,
+        progress.total,
+        progress.unit.value,
+        progress.current,
+        _datetime_to_text(progress.stage_started_at),
+        _datetime_to_text(progress.updated_at),
+    )
+
+
+def _require_progress(record: JobRecord) -> JobProgress:
+    if record.progress is None:  # pragma: no cover - JobRecord normalizes this invariant
+        msg = 'job record progress is required'
+        raise ValueError(msg)
+    return record.progress
 
 
 def _datetime_to_text(value: datetime) -> str:

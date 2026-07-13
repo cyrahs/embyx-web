@@ -3,9 +3,11 @@ import {
   ApiError,
   applyCandidates,
   createPlan,
+  getActivePlanId,
   getHealth,
   getPlan,
   hasApiToken,
+  setActivePlanId,
   setApiToken as storeApiToken,
   type HealthStatus,
 } from './api'
@@ -24,6 +26,43 @@ import type {
 const ACTOR_ID = /^[A-Za-z0-9_-]{1,32}$/
 const MAX_ACTORS = 20
 const STALE_CODES = new Set(['expired_plan', 'revision_mismatch', 'unknown_plan'])
+const BUSINESS_PROGRESS_WARNING_SECONDS = 60
+const HEARTBEAT_WARNING_SECONDS = 35
+
+const STAGE_LABELS: Record<string, string> = {
+  queued: '任务已排队',
+  actor_catalog: '正在获取演员作品',
+  actor_fetch: '正在获取演员作品',
+  fetching_actors: '正在获取演员作品',
+  actors: '正在获取演员作品',
+  library_scan: '正在扫描本地片库',
+  video_scan: '正在扫描本地片库',
+  scanning_videos: '正在扫描本地片库',
+  videos: '正在扫描本地片库',
+  magnet_lookup: '正在查询磁力资源',
+  magnet_search: '正在查询磁力资源',
+  magnets: '正在查询磁力资源',
+  persisting: '正在保存扫描结果',
+  finalizing: '正在整理扫描结果',
+  saving_plan: '正在保存扫描结果',
+  done: '扫描已完成',
+  unknown: '正在处理扫描任务',
+}
+
+const UNIT_LABELS: Record<string, string> = {
+  actor: '位演员',
+  actors: '位演员',
+  page: '页',
+  pages: '页',
+  video: '个作品',
+  videos: '个作品',
+  magnet: '个磁力查询',
+  magnets: '个磁力查询',
+  item: '项',
+  items: '项',
+  step: '步',
+  steps: '步',
+}
 
 const VIDEO_GROUPS: Array<{
   state: VideoState
@@ -94,7 +133,54 @@ function progressValue(progress?: JobProgress | null): number | null {
   return null
 }
 
+function safeSeconds(value: number | null | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null
+}
+
+function secondsSince(value: string | null | undefined, now: number): number | null {
+  if (!value) return null
+  const timestamp = Date.parse(value)
+  return Number.isFinite(timestamp) ? Math.max(0, Math.floor((now - timestamp) / 1000)) : null
+}
+
+function durationText(rawSeconds: number): string {
+  const seconds = Math.max(0, Math.floor(rawSeconds))
+  if (seconds < 60) return `${seconds} 秒`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes} 分 ${seconds % 60} 秒`
+  const hours = Math.floor(minutes / 60)
+  return `${hours} 小时 ${minutes % 60} 分`
+}
+
+function stageElapsed(progress: JobProgress | null | undefined, now: number): number | null {
+  if (!progress) return null
+  const fromStart = secondsSince(progress.stage_started_at, now)
+  if (fromStart !== null) return fromStart
+  const elapsed = safeSeconds(progress.elapsed_seconds)
+  if (elapsed === null) return null
+  return elapsed + (secondsSince(progress.updated_at, now) ?? 0)
+}
+
+function remainingEta(progress: JobProgress | null | undefined): number | null {
+  return safeSeconds(progress?.eta_seconds)
+}
+
+function lastProgressAge(progress: JobProgress | null | undefined, now: number): number | null {
+  if (!progress) return null
+  return secondsSince(progress.updated_at, now) ?? safeSeconds(progress.last_progress_seconds)
+}
+
+function progressCount(progress: JobProgress | null | undefined): string | null {
+  const completed = safeSeconds(progress?.completed)
+  if (completed === null) return null
+  const count = Math.floor(completed)
+  const total = safeSeconds(progress?.total)
+  const unit = progress?.unit ? (UNIT_LABELS[progress.unit] ?? progress.unit) : '项'
+  return total === null ? `已完成 ${count} ${unit}` : `${count} / ${Math.floor(total)} ${unit}`
+}
+
 export default function App() {
+  const [recoveredPlanId] = useState(getActivePlanId)
   const [input, setInput] = useState('')
   const [apiTokenInput, setApiTokenInput] = useState('')
   const [authRequired, setAuthRequired] = useState(false)
@@ -102,10 +188,13 @@ export default function App() {
   const [health, setHealth] = useState<HealthStatus | null>(null)
   const [healthFailed, setHealthFailed] = useState(false)
   const [plan, setPlan] = useState<FillActorPlan | null>(null)
-  const [planId, setPlanId] = useState<string | null>(null)
-  const [job, setJob] = useState<PlanJob | null>(null)
+  const [planId, setPlanId] = useState<string | null>(recoveredPlanId)
+  const [job, setJob] = useState<PlanJob | null>(() => recoveredPlanId
+    ? { plan_id: recoveredPlanId, state: 'running' }
+    : null)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [pollWarning, setPollWarning] = useState<string | null>(null)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [confirmOpen, setConfirmOpen] = useState(false)
   const [applying, setApplying] = useState(false)
@@ -119,7 +208,7 @@ export default function App() {
   const candidates = useMemo(() => candidateMap(plan), [plan])
   const selectedCandidates = [...selected].map((id) => candidates.get(id)).filter(Boolean) as MoveCandidate[]
   const planExpired = Boolean(plan && new Date(plan.expires_at).getTime() <= now)
-  const progress = progressValue(job?.progress)
+  const jobPending = isJobPending(job)
   const healthReady = Boolean(health && ['ok', 'healthy', 'ready'].includes(health.status.toLowerCase()))
 
   useEffect(() => {
@@ -137,9 +226,15 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 30_000)
+    setNow(Date.now())
+    const timer = window.setInterval(() => setNow(Date.now()), jobPending ? 1_000 : 30_000)
     return () => window.clearInterval(timer)
-  }, [])
+  }, [jobPending])
+
+  useEffect(() => {
+    if (planId && jobPending) setActivePlanId(planId)
+    else if (job || plan) setActivePlanId(null)
+  }, [job, jobPending, plan, planId])
 
   useEffect(() => {
     if (!plan || lastAutoSelectedRevision.current === plan.revision) return
@@ -158,18 +253,20 @@ export default function App() {
       void getPlan(planId, controller.signal)
         .then((envelope) => {
           pollFailures.current = 0
+          setPollWarning(null)
           consumeEnvelope(envelope, setPlan, setPlanId, setJob, setError)
         })
         .catch((pollError: unknown) => {
           if (pollError instanceof DOMException && pollError.name === 'AbortError') return
-          setError(errorMessage(pollError))
           if (pollError instanceof ApiError && pollError.code === 'unauthorized') {
             setAuthRequired(true)
+            setError(errorMessage(pollError))
           } else if (pollError instanceof ApiError && STALE_CODES.has(pollError.code)) {
             setNeedsFreshPlan(true)
             setJob((current) => current ? { ...current, state: 'failed', error_code: pollError.code } : current)
           } else {
             pollFailures.current += 1
+            setPollWarning('暂时无法刷新任务状态，将自动重试。')
             setJob((current) => current ? { ...current } : current)
           }
         })
@@ -184,6 +281,8 @@ export default function App() {
     if (!parsed.actorIds.length || parsed.invalid.length || parsed.actorIds.length > MAX_ACTORS) return
     setSubmitting(true)
     setError(null)
+    setPollWarning(null)
+    setActivePlanId(null)
     setPlan(null)
     setPlanId(null)
     setJob(null)
@@ -285,7 +384,7 @@ export default function App() {
               onChange={(event) => setInput(event.target.value)}
               placeholder={'例如：A12345, B67890\n支持空格、逗号或换行分隔'}
               rows={4}
-              disabled={submitting || isJobPending(job)}
+              disabled={submitting || jobPending}
             />
             <div className="input-footer">
               <span>仅支持字母、数字、下划线和连字符</span>
@@ -320,26 +419,16 @@ export default function App() {
           <button
             className="button primary scan-button"
             type="button"
-            disabled={!parsed.actorIds.length || Boolean(parsed.invalid.length) || parsed.actorIds.length > MAX_ACTORS || submitting || isJobPending(job)}
+            disabled={!parsed.actorIds.length || Boolean(parsed.invalid.length) || parsed.actorIds.length > MAX_ACTORS || submitting || jobPending}
             onClick={() => void startScan()}
           >
-            {submitting || isJobPending(job) ? <Spinner /> : <ScanIcon />}
-            {submitting ? '正在提交' : isJobPending(job) ? '正在扫描' : '开始扫描'}
+            {submitting || jobPending ? <Spinner /> : <ScanIcon />}
+            {submitting ? '正在提交' : jobPending ? '正在扫描' : '开始扫描'}
           </button>
         </section>
 
-        {(submitting || isJobPending(job)) && (
-          <section className="progress-panel" aria-live="polite">
-            <div className="progress-orbit"><Spinner /></div>
-            <div className="progress-copy">
-              <strong>{jobState(job) === 'queued' ? '任务已排队' : '正在检查作品与文件'}</strong>
-              <span>{job?.progress?.current ?? '这可能需要一点时间，请保持页面开启。'}</span>
-            </div>
-            <div className="progress-track" aria-label="扫描进度">
-              <span className={progress === null ? 'indeterminate' : ''} style={progress === null ? undefined : { width: `${progress}%` }} />
-            </div>
-            {progress !== null && <b>{progress}%</b>}
-          </section>
+        {(submitting || jobPending) && (
+          <ProgressPanel job={job} now={now} pollWarning={pollWarning} submitting={submitting} />
         )}
 
         {error && <Notice tone="error" title="操作未完成" body={error} />}
@@ -423,6 +512,87 @@ export default function App() {
         </div>
       )}
     </div>
+  )
+}
+
+function ProgressPanel({
+  job,
+  now,
+  pollWarning,
+  submitting,
+}: {
+  job: PlanJob | null
+  now: number
+  pollWarning: string | null
+  submitting: boolean
+}) {
+  const progress = job?.progress
+  const value = progressValue(progress)
+  const state = jobState(job)
+  const stage = progress?.stage ?? null
+  const title = submitting
+    ? '正在提交任务'
+    : state === 'queued'
+      ? '任务已排队'
+      : stage
+        ? (STAGE_LABELS[stage] ?? '正在处理扫描任务')
+        : '正在恢复扫描状态'
+  const count = progressCount(progress)
+  const elapsed = stageElapsed(progress, now)
+  const eta = remainingEta(progress)
+  const progressAge = lastProgressAge(progress, now)
+  const heartbeatAge = secondsSince(job?.updated_at, now)
+  const progressWarning = state === 'running'
+    && progressAge !== null
+    && progressAge >= BUSINESS_PROGRESS_WARNING_SECONDS
+  const heartbeatWarning = state === 'running'
+    && heartbeatAge !== null
+    && heartbeatAge >= HEARTBEAT_WARNING_SECONDS
+  const valueText = count ?? (value === null ? '进度计算中' : `${Math.round(value)}%`)
+
+  return (
+    <section className="progress-panel" aria-busy="true" aria-labelledby="scan-progress-title">
+      <div className="progress-orbit"><Spinner /></div>
+      <div className="progress-body">
+        <div className="progress-copy" role="status" aria-live="polite" aria-atomic="true">
+          <strong id="scan-progress-title">{title}</strong>
+          <span>{progress?.current ? `当前：${progress.current}` : '正在等待最新进度…'}</span>
+        </div>
+
+        <div className="progress-meter">
+          <div
+            className="progress-track"
+            role="progressbar"
+            aria-label={`${title}进度`}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={value === null ? undefined : Math.round(value)}
+            aria-valuetext={valueText}
+          >
+            <span
+              className={value === null ? 'indeterminate' : ''}
+              style={value === null ? undefined : { width: `${value}%` }}
+            />
+          </div>
+          <b>{value === null ? '计算中' : `${Math.round(value)}%`}</b>
+        </div>
+
+        <dl className="progress-meta">
+          <div><dt>阶段进度</dt><dd>{count ?? '等待统计'}</dd></div>
+          <div><dt>阶段已用时</dt><dd>{elapsed === null ? '等待统计' : durationText(elapsed)}</dd></div>
+          <div><dt>当前阶段 ETA</dt><dd>{eta === null ? '计算中' : `约 ${durationText(eta)}`}</dd></div>
+          <div><dt>最后进展</dt><dd>{progressAge === null ? '等待首个结果' : `${durationText(progressAge)}前`}</dd></div>
+        </dl>
+
+        {(pollWarning || progressWarning || heartbeatWarning) && (
+          <div className="progress-warnings" role="status" aria-live="polite">
+            {pollWarning && <p>{pollWarning}</p>}
+            {progressWarning && <p>较长时间无新结果，仍可能在等待外部服务。</p>}
+            {heartbeatWarning && <p>执行器心跳已较长时间未更新，执行可能已经中断。</p>}
+          </div>
+        )}
+      </div>
+    </section>
   )
 }
 

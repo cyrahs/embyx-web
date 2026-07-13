@@ -1,6 +1,8 @@
 import type { ApplyResult, FillActorPlan, PlanEnvelope, PlanJob } from './types'
 
 const API_TOKEN_KEY = 'embyx-web-api-token'
+const ACTIVE_PLAN_KEY = 'embyx-web-active-plan-id'
+const PLAN_ID = /^[A-Za-z0-9_-]{1,256}$/
 
 export function hasApiToken(): boolean {
   return Boolean(window.sessionStorage.getItem(API_TOKEN_KEY))
@@ -10,6 +12,27 @@ export function setApiToken(value: string): void {
   const token = value.trim()
   if (token) window.sessionStorage.setItem(API_TOKEN_KEY, token)
   else window.sessionStorage.removeItem(API_TOKEN_KEY)
+}
+
+export function getActivePlanId(): string | null {
+  try {
+    const value = window.sessionStorage.getItem(ACTIVE_PLAN_KEY)
+    if (!value) return null
+    if (PLAN_ID.test(value)) return value
+    window.sessionStorage.removeItem(ACTIVE_PLAN_KEY)
+    return null
+  } catch {
+    return null
+  }
+}
+
+export function setActivePlanId(value: string | null): void {
+  try {
+    if (value && PLAN_ID.test(value)) window.sessionStorage.setItem(ACTIVE_PLAN_KEY, value)
+    else window.sessionStorage.removeItem(ACTIVE_PLAN_KEY)
+  } catch {
+    // Session recovery is best-effort; storage restrictions must not block a scan.
+  }
 }
 
 export class ApiError extends Error {
@@ -105,7 +128,9 @@ export async function createPlan(actorIds: string[]): Promise<PlanEnvelope> {
 }
 
 export async function getPlan(planId: string, signal?: AbortSignal): Promise<PlanEnvelope> {
-  return normalizePlanEnvelope(await request(`/api/fill-actor/plans/${encodeURIComponent(planId)}`, { signal }))
+  return normalizePlanEnvelope(
+    await request(`/api/fill-actor/plans/${encodeURIComponent(planId)}`, { cache: 'no-store', signal }),
+  )
 }
 
 export async function applyCandidates(

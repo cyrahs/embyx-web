@@ -59,10 +59,17 @@ export interface ApplyResult {
 }
 
 export interface JobProgress {
+  stage?: string | null
   completed?: number
-  total?: number
-  current?: string
-  percent?: number
+  total?: number | null
+  unit?: string | null
+  current?: string | null
+  stage_started_at?: string | null
+  updated_at?: string | null
+  percent?: number | null
+  eta_seconds?: number | null
+  elapsed_seconds?: number | null
+  last_progress_seconds?: number | null
 }
 
 export interface PlanJob {
@@ -72,6 +79,7 @@ export interface PlanJob {
   state?: JobState
   status?: JobState
   error_code?: string | null
+  updated_at?: string | null
   progress?: JobProgress | null
 }
 
