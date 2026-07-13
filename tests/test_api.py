@@ -60,6 +60,7 @@ def make_client(
     feed_warmer_factory=None,
     freshrss_url: str | None = None,
     freshrss_rsshub_url: str | None = None,
+    apply_enabled: bool = True,
 ) -> tuple[TestClient, FillActorPaths, MemoryFillActorRepository]:
     paths = FillActorPaths.from_iterable(
         actor_brand_path=tmp_path / 'actor',
@@ -75,6 +76,7 @@ def make_client(
         magnet_provider=MagnetProvider(),
         brand_resolver=BrandResolver(),
         repository=repository,
+        apply_enabled=apply_enabled,
     )
     feed_warmer = feed_warmer_factory(repository) if feed_warmer_factory is not None else None
     jobs = FillActorJobManager(service=service, repository=repository, feed_warmer=feed_warmer)
@@ -160,6 +162,7 @@ def test_plan_envelope_exposes_persisted_feed_status_and_freshrss_action(tmp_pat
         feed_warmer_factory=feed_warmer_factory,
         freshrss_url='https://freshrss.example.test',
         freshrss_rsshub_url='https://rsshub.example.test',
+        apply_enabled=False,
     )
     with client:
         created = client.post('/api/fill-actor/plans', json={'actor_ids': ['actor']})
@@ -312,7 +315,47 @@ def test_request_size_limit_and_health(tmp_path: Path) -> None:
     assert oversized.status_code == 413
     assert oversized.json() == {'error': {'code': 'request_too_large'}}
     assert health.status_code == 200
-    assert health.json() == {'status': 'ok', 'database': True, 'roots': True}
+    assert health.json() == {
+        'status': 'ok',
+        'database': True,
+        'roots': True,
+        'cloud': True,
+        'legacy_journal': True,
+        'apply_enabled': True,
+        'apply_ready': True,
+    }
+
+
+def test_disabled_apply_is_exposed_without_affecting_scan_or_readiness(tmp_path: Path) -> None:
+    client, paths, _ = make_client(tmp_path, apply_enabled=False)
+    brand_path = paths.additional_brand_paths[0] / 'ABC'
+    brand_path.mkdir()
+    source = brand_path / 'ABC-001.mp4'
+    source.write_bytes(b'video')
+
+    with client:
+        health = client.get('/api/health')
+        created = client.post('/api/fill-actor/plans', json={'actor_ids': ['actor']})
+        plan_id = created.json()['job']['plan_id']
+        payload = wait_for_plan(client, plan_id)
+        candidate = payload['plan']['videos'][0]['move_candidates'][0]
+        applied = client.post(
+            f'/api/fill-actor/plans/{plan_id}/apply',
+            json={
+                'revision': payload['plan']['revision'],
+                'candidate_ids': [candidate['candidate_id']],
+            },
+        )
+
+    assert health.status_code == 200
+    assert health.json()['status'] == 'ok'
+    assert health.json()['apply_enabled'] is False
+    assert created.status_code == 202
+    assert payload['job']['state'] == 'completed'
+    assert applied.status_code == 503
+    assert applied.json() == {'error': {'code': 'move_disabled'}}
+    assert source.read_bytes() == b'video'
+    assert not (paths.move_in_path / source.name).exists()
 
 
 def test_running_job_does_not_publish_or_apply_plan(tmp_path: Path) -> None:

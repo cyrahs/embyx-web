@@ -20,6 +20,14 @@ class JobQueueFullError(FillActorError):
     code = 'job_queue_full'
 
 
+class MoveDisabledError(FillActorError):
+    code = 'move_disabled'
+
+
+class LegacyPlanError(FillActorError):
+    code = 'legacy_plan_requires_rescan'
+
+
 class UnknownPlanError(FillActorError):
     code = 'unknown_plan'
 

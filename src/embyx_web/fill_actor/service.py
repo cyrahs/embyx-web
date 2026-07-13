@@ -14,11 +14,20 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import partial
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
+from embyx_web.fill_actor.cloud_moves import (
+    CloudFileMetadata,
+    CloudFileMover,
+    CloudMovePaths,
+    CloudMoveResponse,
+    InvalidStrmTargetError,
+)
 from embyx_web.fill_actor.errors import (
     ExpiredPlanError,
     InvalidActorIdError,
+    LegacyPlanError,
+    MoveDisabledError,
     RevisionMismatchError,
     TooManyActorsError,
     TooManyVideosError,
@@ -37,7 +46,10 @@ from embyx_web.fill_actor.models import (
     VideoState,
 )
 from embyx_web.fill_actor.persistence import (
+    CandidateKind,
     CandidateRecord,
+    CloudMoveOperationRecord,
+    CloudMoveOperationState,
     FileFingerprint,
     FillActorRepository,
     JobProgressEvent,
@@ -54,6 +66,9 @@ from embyx_web.locking import AsyncFileLock
 ACTOR_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,32}$')
 DATED_VIDEO_ID_RE = re.compile(r'^(.+)_\d{4}-\d{2}-\d{2}$')
 MAX_MAGNET_LENGTH = 8192
+CLOUD_VERIFY_ATTEMPTS = 5
+CLOUD_HEALTH_SUCCESS_TTL_SECONDS = 30.0
+CLOUD_HEALTH_FAILURE_TTL_SECONDS = 5.0
 ProgressCallback = Callable[[JobProgressEvent], Awaitable[None]]
 
 
@@ -136,6 +151,19 @@ async def _await_mutation_future[T](worker: Future[T], *, propagate_cancellation
     return await _await_executor_future(worker, propagate_cancellation=propagate_cancellation)
 
 
+async def _await_task_complete[T](task: asyncio.Task[T], *, propagate_cancellation: bool = True) -> T:
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    result = task.result()
+    if cancelled and propagate_cancellation:
+        raise asyncio.CancelledError
+    return result
+
+
 def _rename_no_replace(source: Path, destination: Path) -> None:
     libc = ctypes.CDLL(None, use_errno=True)
     renameat2 = getattr(libc, 'renameat2', None)
@@ -178,6 +206,9 @@ class FillActorService:
         mutation_lock: AsyncFileLock | None = None,
         root_sentinel: str | None = None,
         move_in_by_brand: bool = False,
+        apply_enabled: bool = False,
+        cloud_file_mover: CloudFileMover | None = None,
+        cloud_move_paths: CloudMovePaths | None = None,
     ) -> None:
         if max_actors < 1:
             msg = 'max_actors must be positive'
@@ -190,6 +221,12 @@ class FillActorService:
             raise ValueError(msg)
         if plan_ttl <= timedelta(0):
             msg = 'plan_ttl must be positive'
+            raise ValueError(msg)
+        if (cloud_file_mover is None) is not (cloud_move_paths is None):
+            msg = 'CloudDrive mover and path mapping must be configured together'
+            raise ValueError(msg)
+        if cloud_move_paths is not None and len(cloud_move_paths.source_api_roots) != len(paths.additional_brand_paths):
+            msg = 'CloudDrive source roots must match additional roots one-for-one'
             raise ValueError(msg)
 
         self._paths = paths
@@ -210,10 +247,15 @@ class FillActorService:
             raise ValueError(msg)
         self._root_sentinel = root_sentinel
         self._move_in_by_brand = move_in_by_brand
+        self._apply_enabled = apply_enabled
+        self._cloud_file_mover = cloud_file_mover
+        self._cloud_move_paths = cloud_move_paths
         self._in_flight: dict[tuple[str, str], asyncio.Task[MoveResult]] = {}
         self._mutation_futures: set[Future[MoveResult]] = set()
         self._scan_futures: dict[Future[object], threading.Event] = {}
         self._apply_lock = asyncio.Lock()
+        self._cloud_health_lock = asyncio.Lock()
+        self._cloud_health_cache: tuple[float, bool] | None = None
 
     async def create_plan(  # noqa: C901, PLR0915
         self,
@@ -300,6 +342,7 @@ class FillActorService:
 
         public_videos: dict[str, VideoPlan] = {}
         records: dict[str, _MoveRecord] = {}
+        cloud_directory_cache: dict[str, tuple[CloudFileMetadata, ...] | None] = {}
         magnet_video_ids: list[str] = []
         video_total = len(video_actors)
 
@@ -319,6 +362,7 @@ class FillActorService:
                 video_plan, video_records, needs_magnet = await self._create_video_plan(
                     video_id,
                     actor_membership,
+                    cloud_directory_cache=cloud_directory_cache,
                 )
             except Exception:  # noqa: BLE001
                 public_videos[video_id] = VideoPlan(
@@ -406,6 +450,8 @@ class FillActorService:
         self,
         video_id: str,
         actor_membership: tuple[str, ...],
+        *,
+        cloud_directory_cache: dict[str, tuple[CloudFileMetadata, ...] | None],
     ) -> tuple[VideoPlan, tuple[_MoveRecord, ...], bool]:
         brand = self._brand_resolver.resolve_brand(video_id)
         if not brand or not self._is_safe_segment(brand):
@@ -446,6 +492,15 @@ class FillActorService:
                 True,
             )
 
+        if self._cloud_file_mover is not None and self._cloud_move_paths is not None:
+            return await self._create_cloud_video_plan(
+                video_id=video_id,
+                actor_membership=actor_membership,
+                brand=brand,
+                additional=additional,
+                directory_cache=cloud_directory_cache,
+            )
+
         candidates: list[MoveCandidate] = []
         records: list[_MoveRecord] = []
         for source_index, source in additional:
@@ -482,7 +537,152 @@ class FillActorService:
             False,
         )
 
+    async def _create_cloud_video_plan(
+        self,
+        *,
+        video_id: str,
+        actor_membership: tuple[str, ...],
+        brand: str,
+        additional: tuple[tuple[int, Path], ...],
+        directory_cache: dict[str, tuple[CloudFileMetadata, ...] | None],
+    ) -> tuple[VideoPlan, tuple[_MoveRecord, ...], bool]:
+        if self._cloud_move_paths is None:
+            msg = 'CloudDrive paths are not configured'
+            raise RuntimeError(msg)
+        candidates: list[MoveCandidate] = []
+        records: list[_MoveRecord] = []
+        existing_files: list[str] = []
+        warnings: list[str] = []
+        destination_dir = self._cloud_move_paths.destination_directory(brand)
+        destination_listing = await self._list_cloud_directory_cached(destination_dir, directory_cache)
+
+        for source_index, mapping_path in additional:
+            if mapping_path.suffix.casefold() != '.strm':
+                warnings.append('cloud_mapping_not_strm')
+                continue
+            try:
+                parsed = self._cloud_move_paths.parse_mapping(mapping_path, source_index=source_index)
+            except (InvalidStrmTargetError, ValueError):
+                warnings.append('invalid_strm_target')
+                continue
+            cloud_file = await self._cloud_file_cached(parsed.api_path, directory_cache)
+            destination_path = str(PurePosixPath(destination_dir) / PurePosixPath(parsed.api_path).name)
+            destination_file = self._find_cloud_file(destination_path, destination_listing)
+            if cloud_file is None:
+                if destination_file is not None:
+                    existing_files.append(destination_file.name)
+                else:
+                    warnings.append('cloud_source_missing')
+                continue
+            if not self._matches_video_file_name(cloud_file.name, video_id):
+                warnings.append('cloud_source_name_mismatch')
+                continue
+
+            candidate_id = self._token_factory()
+            mapping_destination_root = (
+                self._paths.move_in_path / brand if self._move_in_by_brand else self._paths.move_in_path
+            )
+            records.append(
+                _MoveRecord(
+                    candidate_id=candidate_id,
+                    video_id=video_id,
+                    source=mapping_path,
+                    source_root=self._paths.additional_brand_paths[source_index],
+                    destination=mapping_destination_root / mapping_path.name,
+                    fingerprint=self._fingerprint(mapping_path),
+                    kind=CandidateKind.CLOUD_STRM,
+                    mapping_sha256=parsed.mapping_sha256,
+                    cloud_source_path=parsed.api_path,
+                    cloud_destination_dir=destination_dir,
+                    cloud_file=cloud_file,
+                )
+            )
+            candidates.append(
+                MoveCandidate(
+                    candidate_id=candidate_id,
+                    video_id=video_id,
+                    file_name=cloud_file.name,
+                    source_label=f'additional-{source_index + 1}',
+                    destination_conflict=destination_file is not None,
+                )
+            )
+
+        if candidates:
+            return (
+                VideoPlan(
+                    video_id=video_id,
+                    actor_ids=actor_membership,
+                    state=VideoState.ADDITIONAL_FOUND,
+                    existing_files=tuple(sorted(set(existing_files))),
+                    move_candidates=tuple(candidates),
+                    warnings=tuple(dict.fromkeys(warnings)),
+                ),
+                tuple(records),
+                False,
+            )
+        if existing_files:
+            return (
+                VideoPlan(
+                    video_id=video_id,
+                    actor_ids=actor_membership,
+                    state=VideoState.EXISTS,
+                    existing_files=tuple(sorted(set(existing_files))),
+                    warnings=('mapping_convergence_pending',),
+                ),
+                (),
+                False,
+            )
+        return (
+            VideoPlan(
+                video_id=video_id,
+                actor_ids=actor_membership,
+                state=VideoState.SCAN_FAILED,
+                warnings=tuple(dict.fromkeys(warnings)) or ('cloud_scan_failed',),
+            ),
+            (),
+            False,
+        )
+
+    async def _list_cloud_directory_cached(
+        self,
+        api_directory: str,
+        cache: dict[str, tuple[CloudFileMetadata, ...] | None],
+    ) -> tuple[CloudFileMetadata, ...] | None:
+        if api_directory not in cache:
+            if self._cloud_file_mover is None:
+                msg = 'CloudDrive mover is not configured'
+                raise RuntimeError(msg)
+            try:
+                cache[api_directory] = await self._cloud_file_mover.list_directory(api_directory)
+            except FileNotFoundError:
+                cache[api_directory] = None
+        return cache[api_directory]
+
+    async def _cloud_file_cached(
+        self,
+        api_path: str,
+        cache: dict[str, tuple[CloudFileMetadata, ...] | None],
+    ) -> CloudFileMetadata | None:
+        parent = str(PurePosixPath(api_path).parent)
+        return self._find_cloud_file(api_path, await self._list_cloud_directory_cached(parent, cache))
+
+    @staticmethod
+    def _find_cloud_file(
+        api_path: str,
+        listing: tuple[CloudFileMetadata, ...] | None,
+    ) -> CloudFileMetadata | None:
+        if listing is None:
+            return None
+        return next((file for file in listing if file.path == api_path), None)
+
+    @staticmethod
+    def _matches_video_file_name(file_name: str, video_id: str) -> bool:
+        pattern = re.compile(rf'^{re.escape(video_id)}(?:-cd\d{{1,2}})?\..+', re.IGNORECASE)
+        return bool(pattern.fullmatch(file_name))
+
     async def apply(self, *, plan_id: str, revision: str, candidate_ids: Sequence[str]) -> ApplyResult:
+        if not self._apply_enabled:
+            raise MoveDisabledError
         async with self._apply_lock:
             stored = await self._get_plan(plan_id, revision)
             selected = tuple(dict.fromkeys(candidate_ids))
@@ -490,6 +690,10 @@ class FillActorService:
             unknown = [candidate_id for candidate_id in selected if candidate_id not in candidates]
             if unknown:
                 raise UnknownCandidateError(unknown[0])
+            if self._cloud_file_mover is not None and any(
+                candidates[candidate_id].kind is not CandidateKind.CLOUD_STRM for candidate_id in selected
+            ):
+                raise LegacyPlanError
 
             results: list[MoveResult] = []
             for candidate_id in selected:
@@ -584,19 +788,31 @@ class FillActorService:
         videos: dict[str, VideoPlan],
         records: dict[str, _MoveRecord],
     ) -> None:
-        destination_counts = Counter(record.destination for record in records.values())
+        destination_counts = Counter(FillActorService._candidate_destination_key(record) for record in records.values())
         for video_id, video in videos.items():
             updated_candidates = tuple(
                 candidate.model_copy(
                     update={
                         'destination_conflict': candidate.destination_conflict
-                        or destination_counts[records[candidate.candidate_id].destination] > 1,
+                        or destination_counts[
+                            FillActorService._candidate_destination_key(records[candidate.candidate_id])
+                        ]
+                        > 1,
                     }
                 )
                 for candidate in video.move_candidates
             )
             if updated_candidates:
                 videos[video_id] = video.model_copy(update={'move_candidates': updated_candidates})
+
+    @staticmethod
+    def _candidate_destination_key(record: _MoveRecord) -> str:
+        if record.kind is CandidateKind.CLOUD_STRM:
+            if record.cloud_destination_dir is None or record.cloud_file is None:
+                msg = 'CloudDrive candidate is incomplete'
+                raise ValueError(msg)
+            return str(PurePosixPath(record.cloud_destination_dir) / record.cloud_file.name)
+        return str(record.destination)
 
     async def _find_magnets(
         self,
@@ -830,8 +1046,10 @@ class FillActorService:
 
     @staticmethod
     def _is_safe_segment(value: str) -> bool:
+        if not value or value in {'.', '..'} or '/' in value or '\\' in value or '\x00' in value:
+            return False
         path = Path(value)
-        return bool(value) and value not in {'.', '..'} and not path.is_absolute() and path.name == value
+        return not path.is_absolute() and path.name == value
 
     @staticmethod
     def _is_within(path: Path, root: Path) -> bool:
@@ -865,8 +1083,26 @@ class FillActorService:
         return ApplyState.FAILED
 
     async def reconcile_moves(self) -> tuple[MoveResult, ...]:
+        if not self._apply_enabled:
+            return ()
         if not await self.roots_ready():
             return ()
+        if self._cloud_file_mover is not None:
+            results: list[MoveResult] = []
+            for operation in await self._repository.list_unresolved_cloud_moves():
+                record = await self._repository.get_candidate(operation.plan_id, operation.candidate_id)
+                if record is None or record.kind is not CandidateKind.CLOUD_STRM:
+                    continue
+                context = self._mutation_lock.acquire() if self._mutation_lock is not None else _unlocked()
+                async with context:
+                    current = await self._repository.get_cloud_move_operation(
+                        operation.plan_id,
+                        operation.candidate_id,
+                    )
+                    if current is None or current.state.terminal:
+                        continue
+                    results.append(await self._recover_cloud_move(operation.plan_id, record, current))
+            return tuple(results)
         results: list[MoveResult] = []
         for journal in await self._repository.list_unreconciled_moves():
             record = await self._repository.get_candidate(journal.plan_id, journal.candidate_id)
@@ -880,6 +1116,51 @@ class FillActorService:
                 result = await self._reconcile_candidate(journal.plan_id, record, current)
                 results.append(result)
         return tuple(results)
+
+    @property
+    def apply_enabled(self) -> bool:
+        return self._apply_enabled
+
+    async def ready(self) -> bool:
+        return await self.scan_ready()
+
+    async def scan_ready(self) -> bool:
+        return await self.roots_ready() and await self.cloud_ready()
+
+    async def apply_ready(self) -> bool:
+        return await self.scan_ready() and await self.legacy_journal_ready()
+
+    async def cloud_ready(self) -> bool:
+        if self._cloud_file_mover is None:
+            return self._cloud_move_paths is None
+        if self._cloud_move_paths is None:
+            return False
+        now = asyncio.get_running_loop().time()
+        cached = self._cloud_health_cache
+        if cached is not None and now < cached[0]:
+            return cached[1]
+        async with self._cloud_health_lock:
+            now = asyncio.get_running_loop().time()
+            cached = self._cloud_health_cache
+            if cached is not None and now < cached[0]:
+                return cached[1]
+            try:
+                roots = (*self._cloud_move_paths.source_api_roots, self._cloud_move_paths.move_in_api_root)
+                for root in roots:
+                    await self._cloud_file_mover.list_directory(str(root))
+            except Exception:  # noqa: BLE001
+                result = False
+                ttl = CLOUD_HEALTH_FAILURE_TTL_SECONDS
+            else:
+                result = True
+                ttl = CLOUD_HEALTH_SUCCESS_TTL_SECONDS
+            self._cloud_health_cache = (now + ttl, result)
+            return result
+
+    async def legacy_journal_ready(self) -> bool:
+        if self._cloud_file_mover is None:
+            return True
+        return not await self._repository.list_unreconciled_moves()
 
     async def roots_ready(self) -> bool:
         roots = (
@@ -912,8 +1193,361 @@ class FillActorService:
             await _await_executor_future(worker, propagate_cancellation=False)
         for worker in tuple(self._mutation_futures):
             await _await_mutation_future(worker, propagate_cancellation=False)
+        for task in tuple(self._in_flight.values()):
+            with suppress(asyncio.CancelledError, Exception):
+                await _await_task_complete(task, propagate_cancellation=False)
+
+    async def _run_cloud_move(  # noqa: C901, PLR0911, PLR0912, PLR0915
+        self,
+        plan_id: str,
+        record: _MoveRecord,
+    ) -> MoveResult:
+        base = self._cloud_result_base(record)
+        if self._cloud_file_mover is None or self._cloud_move_paths is None or record.cloud_file is None:
+            return MoveResult(**base, state=MoveState.FAILED, error_code='cloud_move_not_configured')
+        if not await self.roots_ready():
+            return MoveResult(**base, state=MoveState.FAILED, error_code='root_unavailable')
+        context = self._mutation_lock.acquire() if self._mutation_lock is not None else _unlocked()
+        async with context:
+            cached = await self._repository.get_move_result(plan_id, record.candidate_id)
+            if cached is not None:
+                return cached
+            operation = await self._repository.get_cloud_move_operation(plan_id, record.candidate_id)
+            if operation is not None:
+                return await self._recover_cloud_move(plan_id, record, operation)
+
+            mapping_error = self._validate_cloud_mapping(record)
+            if mapping_error is not None:
+                result = MoveResult(**base, state=MoveState.STALE, error_code=mapping_error)
+                await self._repository.save_move_result(plan_id, result)
+                return result
+
+            try:
+                source = await self._stat_cloud_file(record.cloud_source_path)
+                destination_listing = await self._list_cloud_directory(record.cloud_destination_dir)
+            except Exception:  # noqa: BLE001
+                return MoveResult(**base, state=MoveState.FAILED, error_code='cloud_preflight_failed')
+            if source is None:
+                result = MoveResult(**base, state=MoveState.STALE, error_code='cloud_source_missing')
+                await self._repository.save_move_result(plan_id, result)
+                return result
+            if not record.cloud_file.matches_identity(source):
+                result = MoveResult(**base, state=MoveState.STALE, error_code='cloud_source_changed')
+                await self._repository.save_move_result(plan_id, result)
+                return result
+            if destination_listing is None:
+                destination = self._cloud_destination_components(record)
+                if destination is None:
+                    result = MoveResult(
+                        **base,
+                        state=MoveState.INVALID_PATH,
+                        error_code='cloud_destination_changed',
+                    )
+                    await self._repository.save_move_result(plan_id, result)
+                    return result
+                destination_parent, destination_brand, _destination_dir = destination
+                try:
+                    ensured = await self._cloud_file_mover.ensure_directory(
+                        destination_parent,
+                        destination_brand,
+                    )
+                    destination_listing = (
+                        await self._list_cloud_directory(record.cloud_destination_dir) if ensured else None
+                    )
+                except Exception:  # noqa: BLE001
+                    destination_listing = None
+                if destination_listing is None:
+                    result = MoveResult(
+                        **base,
+                        state=MoveState.INVALID_PATH,
+                        error_code='cloud_destination_missing',
+                    )
+                    await self._repository.save_move_result(plan_id, result)
+                    return result
+            destination_path = str(PurePosixPath(record.cloud_destination_dir) / record.cloud_file.name)
+            if self._find_cloud_file(destination_path, destination_listing) is not None:
+                result = MoveResult(**base, state=MoveState.CONFLICT, error_code='cloud_destination_exists')
+                await self._repository.save_move_result(plan_id, result)
+                return result
+
+            # MoveFile accepts only a path, not an expected file id. Recheck immediately
+            # before journaling/submission to minimize the unavoidable remote TOCTOU window.
+            try:
+                final_source = await self._stat_cloud_file(record.cloud_source_path)
+                final_destination = await self._stat_cloud_file(destination_path)
+            except Exception:  # noqa: BLE001
+                return MoveResult(**base, state=MoveState.FAILED, error_code='cloud_preflight_failed')
+            if final_source is None or not record.cloud_file.matches_identity(final_source):
+                result = MoveResult(**base, state=MoveState.STALE, error_code='cloud_source_changed')
+                await self._repository.save_move_result(plan_id, result)
+                return result
+            if final_destination is not None:
+                result = MoveResult(**base, state=MoveState.CONFLICT, error_code='cloud_destination_exists')
+                await self._repository.save_move_result(plan_id, result)
+                return result
+
+            operation = CloudMoveOperationRecord(
+                plan_id=plan_id,
+                candidate_id=record.candidate_id,
+                attempt_id=self._token_factory(),
+                source_path=record.cloud_source_path,
+                destination_dir=record.cloud_destination_dir,
+                state=CloudMoveOperationState.PREPARED,
+                updated_at=self._now(),
+            )
+            try:
+                await self._repository.save_cloud_move_operation(operation)
+            except ValueError:
+                return MoveResult(**base, state=MoveState.FAILED, error_code='cloud_move_in_progress')
+            operation = await self._advance_cloud_operation(operation, CloudMoveOperationState.SUBMITTING)
+            try:
+                response = await self._cloud_file_mover.move_file(
+                    record.cloud_source_path,
+                    record.cloud_destination_dir,
+                )
+            except Exception:  # noqa: BLE001
+                operation = await self._advance_cloud_operation(
+                    operation,
+                    CloudMoveOperationState.UNKNOWN,
+                    error_code='cloud_move_transport_unknown',
+                )
+                return await self._observe_cloud_move(plan_id, record, operation)
+
+            operation = await self._advance_cloud_operation(operation, CloudMoveOperationState.VERIFYING)
+            for attempt in range(CLOUD_VERIFY_ATTEMPTS):
+                result = await self._observe_cloud_move(
+                    plan_id,
+                    record,
+                    operation,
+                    response=response,
+                    final=attempt == CLOUD_VERIFY_ATTEMPTS - 1,
+                )
+                if result.error_code != 'cloud_move_verifying':
+                    return result
+                await asyncio.sleep(0.5)
+            return MoveResult(**base, state=MoveState.FAILED, error_code='cloud_move_status_unknown')
+
+    async def _recover_cloud_move(
+        self,
+        plan_id: str,
+        record: _MoveRecord,
+        operation: CloudMoveOperationRecord,
+    ) -> MoveResult:
+        if operation.state.terminal:
+            result = self._terminal_cloud_result(record, operation)
+            await self._repository.finalize_cloud_move(operation, result)
+            return result
+        if operation.state is CloudMoveOperationState.PREPARED:
+            return await self._complete_cloud_move(
+                plan_id,
+                record,
+                operation,
+                operation_state=CloudMoveOperationState.FAILED,
+                move_state=MoveState.FAILED,
+                error_code='cloud_move_not_submitted',
+            )
+        if operation.state is CloudMoveOperationState.SUBMITTING:
+            operation = await self._advance_cloud_operation(
+                operation,
+                CloudMoveOperationState.UNKNOWN,
+                error_code='cloud_move_interrupted',
+            )
+        return await self._observe_cloud_move(plan_id, record, operation, final=True)
+
+    async def _observe_cloud_move(  # noqa: PLR0911
+        self,
+        plan_id: str,
+        record: _MoveRecord,
+        operation: CloudMoveOperationRecord,
+        *,
+        response: CloudMoveResponse | None = None,
+        final: bool = True,
+    ) -> MoveResult:
+        base = self._cloud_result_base(record)
+        if record.cloud_file is None:
+            return MoveResult(**base, state=MoveState.FAILED, error_code='cloud_candidate_incomplete')
+        destination_path = str(PurePosixPath(operation.destination_dir) / record.cloud_file.name)
+        try:
+            source = await self._stat_cloud_file(operation.source_path)
+            destination = await self._stat_cloud_file(destination_path)
+        except Exception:  # noqa: BLE001
+            if operation.state is not CloudMoveOperationState.UNKNOWN:
+                operation = await self._advance_cloud_operation(
+                    operation,
+                    CloudMoveOperationState.UNKNOWN,
+                    error_code='cloud_observation_failed',
+                )
+            return MoveResult(**base, state=MoveState.FAILED, error_code='cloud_move_status_unknown')
+
+        source_matches = source is not None and record.cloud_file.matches_identity(source)
+        destination_matches = destination is not None and record.cloud_file.matches_identity(destination)
+        if source is None and destination_matches:
+            return await self._complete_cloud_move(
+                plan_id,
+                record,
+                operation,
+                operation_state=CloudMoveOperationState.SUCCEEDED,
+                move_state=MoveState.MOVED,
+                error_code=None,
+            )
+        if source_matches and destination is not None and not destination_matches:
+            return await self._complete_cloud_move(
+                plan_id,
+                record,
+                operation,
+                operation_state=CloudMoveOperationState.CONFLICT,
+                move_state=MoveState.CONFLICT,
+                error_code='cloud_destination_exists',
+            )
+        if source is not None and not source_matches:
+            return await self._complete_cloud_move(
+                plan_id,
+                record,
+                operation,
+                operation_state=CloudMoveOperationState.FAILED,
+                move_state=MoveState.STALE,
+                error_code='cloud_source_changed',
+            )
+        if response is not None and not response.success and source_matches and destination is None:
+            return await self._complete_cloud_move(
+                plan_id,
+                record,
+                operation,
+                operation_state=CloudMoveOperationState.FAILED,
+                move_state=MoveState.FAILED,
+                error_code='cloud_move_rejected',
+            )
+        if not final:
+            return MoveResult(**base, state=MoveState.FAILED, error_code='cloud_move_verifying')
+        if operation.state is not CloudMoveOperationState.UNKNOWN:
+            operation = await self._advance_cloud_operation(
+                operation,
+                CloudMoveOperationState.UNKNOWN,
+                error_code='cloud_move_status_unknown',
+            )
+        return MoveResult(**base, state=MoveState.FAILED, error_code='cloud_move_status_unknown')
+
+    async def _complete_cloud_move(  # noqa: PLR0913
+        self,
+        plan_id: str,
+        record: _MoveRecord,
+        operation: CloudMoveOperationRecord,
+        *,
+        operation_state: CloudMoveOperationState,
+        move_state: MoveState,
+        error_code: str | None,
+    ) -> MoveResult:
+        if operation.plan_id != plan_id:
+            msg = 'CloudDrive operation plan mismatch'
+            raise ValueError(msg)
+        operation = CloudMoveOperationRecord(
+            plan_id=operation.plan_id,
+            candidate_id=operation.candidate_id,
+            attempt_id=operation.attempt_id,
+            source_path=operation.source_path,
+            destination_dir=operation.destination_dir,
+            state=operation_state,
+            updated_at=self._now(),
+            error_code=error_code if operation_state is not CloudMoveOperationState.SUCCEEDED else None,
+        )
+        result = MoveResult(
+            **self._cloud_result_base(record),
+            state=move_state,
+            error_code=error_code,
+        )
+        await self._repository.finalize_cloud_move(operation, result)
+        return result
+
+    async def _advance_cloud_operation(
+        self,
+        operation: CloudMoveOperationRecord,
+        state: CloudMoveOperationState,
+        *,
+        error_code: str | None = None,
+    ) -> CloudMoveOperationRecord:
+        updated = CloudMoveOperationRecord(
+            plan_id=operation.plan_id,
+            candidate_id=operation.candidate_id,
+            attempt_id=operation.attempt_id,
+            source_path=operation.source_path,
+            destination_dir=operation.destination_dir,
+            state=state,
+            updated_at=self._now(),
+            error_code=error_code,
+        )
+        await self._repository.save_cloud_move_operation(updated)
+        return updated
+
+    async def _list_cloud_directory(self, api_directory: str | None) -> tuple[CloudFileMetadata, ...] | None:
+        if api_directory is None or self._cloud_file_mover is None:
+            return None
+        try:
+            return await self._cloud_file_mover.list_directory(api_directory)
+        except FileNotFoundError:
+            return None
+
+    async def _stat_cloud_file(self, api_path: str | None) -> CloudFileMetadata | None:
+        if api_path is None:
+            return None
+        listing = await self._list_cloud_directory(str(PurePosixPath(api_path).parent))
+        return self._find_cloud_file(api_path, listing)
+
+    def _validate_cloud_mapping(self, record: _MoveRecord) -> str | None:  # noqa: PLR0911
+        if self._cloud_move_paths is None or record.mapping_sha256 is None or record.cloud_source_path is None:
+            return 'cloud_candidate_incomplete'
+        if self._has_symlink_component(record.source, record.source_root):
+            return 'source_symlink'
+        if not self._is_within(record.source, record.source_root) or not record.source.is_file():
+            return 'source_missing'
+        try:
+            if self._fingerprint(record.source) != record.fingerprint:
+                return 'source_changed'
+            source_index = self._paths.additional_brand_paths.index(record.source_root)
+            parsed = self._cloud_move_paths.parse_mapping(record.source, source_index=source_index)
+        except (OSError, ValueError, InvalidStrmTargetError):
+            return 'invalid_strm_target'
+        if parsed.mapping_sha256 != record.mapping_sha256 or parsed.api_path != record.cloud_source_path:
+            return 'strm_target_changed'
+        if self._cloud_destination_components(record) is None:
+            return 'cloud_destination_changed'
+        return None
+
+    def _cloud_destination_components(self, record: _MoveRecord) -> tuple[str, str, str] | None:
+        if self._cloud_move_paths is None or record.cloud_destination_dir is None:
+            return None
+        brand = self._brand_resolver.resolve_brand(record.video_id)
+        if not brand or not self._is_safe_segment(brand):
+            return None
+        expected = self._cloud_move_paths.destination_directory(brand)
+        if expected != record.cloud_destination_dir:
+            return None
+        return str(self._cloud_move_paths.move_in_api_root), brand, expected
+
+    @staticmethod
+    def _cloud_result_base(record: _MoveRecord) -> dict[str, str]:
+        file_name = record.cloud_file.name if record.cloud_file is not None else record.source.name
+        return {
+            'candidate_id': record.candidate_id,
+            'video_id': record.video_id,
+            'file_name': file_name,
+        }
+
+    def _terminal_cloud_result(
+        self,
+        record: _MoveRecord,
+        operation: CloudMoveOperationRecord,
+    ) -> MoveResult:
+        mapping = {
+            CloudMoveOperationState.SUCCEEDED: (MoveState.MOVED, None),
+            CloudMoveOperationState.CONFLICT: (MoveState.CONFLICT, operation.error_code),
+            CloudMoveOperationState.FAILED: (MoveState.FAILED, operation.error_code),
+        }
+        move_state, error_code = mapping[operation.state]
+        return MoveResult(**self._cloud_result_base(record), state=move_state, error_code=error_code)
 
     async def _run_move(self, plan_id: str, record: _MoveRecord) -> MoveResult:  # noqa: PLR0911
+        if record.kind is CandidateKind.CLOUD_STRM:
+            return await self._run_cloud_move(plan_id, record)
         if not await self._candidate_roots_ready(record):
             return self._root_unavailable(record)
         context = self._mutation_lock.acquire() if self._mutation_lock is not None else _unlocked()

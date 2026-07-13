@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
@@ -243,7 +243,7 @@ describe('Fill Actor page', () => {
     const user = userEvent.setup()
     const fetchMock = vi.mocked(fetch)
     fetchMock
-      .mockImplementationOnce(() => jsonResponse({ status: 'ok' }))
+      .mockImplementationOnce(() => jsonResponse({ status: 'ok', apply_enabled: true, apply_ready: true }))
       .mockImplementationOnce(() => jsonResponse(plan))
       .mockImplementationOnce(() =>
         jsonResponse({
@@ -271,6 +271,131 @@ describe('Fill Actor page', () => {
       '/api/fill-actor/plans/plan-1/apply',
       expect.objectContaining({ body: JSON.stringify({ revision: 'revision-1', candidate_ids: ['safe-1'] }) }),
     )
+  })
+
+  it('keeps an unknown CloudDrive result in observation-only mode and blocks a repeat apply', async () => {
+    const user = userEvent.setup()
+    const fetchMock = vi.mocked(fetch)
+    fetchMock
+      .mockImplementationOnce(() => jsonResponse({ status: 'ok', apply_enabled: true, apply_ready: true }))
+      .mockImplementationOnce(() => jsonResponse(plan))
+      .mockImplementationOnce(() =>
+        jsonResponse({
+          plan_id: 'plan-1',
+          revision: 'revision-1',
+          state: 'failed',
+          results: [{
+            candidate_id: 'safe-1',
+            video_id: 'ABC-001',
+            file_name: 'ABC-001.mp4',
+            state: 'failed',
+            error_code: 'cloud_move_status_unknown',
+          }],
+        }),
+      )
+
+    render(<App />)
+    await user.type(screen.getByLabelText('演员 ID'), 'A123')
+    await user.click(screen.getByRole('button', { name: '开始扫描' }))
+    await screen.findByText('扫描结果')
+    await user.click(screen.getByRole('button', { name: '确认并移入' }))
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认移入' }))
+
+    expect(await screen.findByText('部分远端状态仍在核验')).toBeInTheDocument()
+    expect(screen.getByText('远端状态待确认，请勿重复操作')).toBeInTheDocument()
+    expect(screen.getByText(/系统只会观察，不会自动重复移动/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '再次应用选择' })).toBeDisabled()
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+  })
+
+  it('explains and blocks file moves while leaving scan results available', async () => {
+    const user = userEvent.setup()
+    const fetchMock = vi.mocked(fetch)
+    fetchMock
+      .mockImplementationOnce(() => jsonResponse({ status: 'ok', apply_enabled: false, apply_ready: false }))
+      .mockImplementationOnce(() => jsonResponse(plan))
+
+    render(<App />)
+    await user.type(screen.getByLabelText('演员 ID'), 'A123')
+    await user.click(screen.getByRole('button', { name: '开始扫描' }))
+    await screen.findByText('扫描结果')
+
+    expect(screen.getByText('文件移动已暂停')).toBeInTheDocument()
+    expect(screen.getByText(/当前仅支持扫描、磁力查询和订阅操作/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '确认并移入' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '复制全部磁力（1）' })).toBeEnabled()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('distinguishes a legacy journal safety block from an administrator kill switch', async () => {
+    const user = userEvent.setup()
+    const fetchMock = vi.mocked(fetch)
+    fetchMock
+      .mockImplementationOnce(() => jsonResponse({
+        status: 'ok',
+        cloud: true,
+        legacy_journal: false,
+        apply_enabled: true,
+        apply_ready: false,
+      }))
+      .mockImplementationOnce(() => jsonResponse(plan))
+
+    render(<App />)
+    await user.type(screen.getByLabelText('演员 ID'), 'A123')
+    await user.click(screen.getByRole('button', { name: '开始扫描' }))
+    await screen.findByText('扫描结果')
+
+    expect(screen.getByText('文件移动等待管理员处理')).toBeInTheDocument()
+    expect(screen.getByText(/检测到旧版本未完成的移动记录/)).toBeInTheDocument()
+    expect(screen.queryByText('文件移动已暂停')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '确认并移入' })).toBeDisabled()
+  })
+
+  it('accepts structured not-ready health and refreshes it on the polling interval', async () => {
+    vi.useFakeTimers()
+    const fetchMock = vi.mocked(fetch)
+    fetchMock
+      .mockImplementationOnce(() => jsonResponse({
+        status: 'not_ready',
+        database: true,
+        roots: true,
+        cloud: false,
+        legacy_journal: true,
+        apply_enabled: true,
+        apply_ready: false,
+      }, 503))
+      .mockImplementationOnce(() => jsonResponse({
+        status: 'ok',
+        database: true,
+        roots: true,
+        cloud: true,
+        legacy_journal: true,
+        apply_enabled: true,
+        apply_ready: true,
+      }))
+
+    const view = render(<App />)
+    try {
+      await act(async () => {
+        await Promise.resolve()
+      })
+      expect(screen.getByText('服务未就绪')).toBeInTheDocument()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000)
+      })
+      expect(screen.getByText('服务正常')).toBeInTheDocument()
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      expect(fetchMock).toHaveBeenNthCalledWith(
+        1,
+        '/api/health',
+        expect.objectContaining({ cache: 'no-store' }),
+      )
+    } finally {
+      view.unmount()
+      vi.useRealTimers()
+    }
   })
 
   it('copies every valid unique magnet in plan order and has no per-row magnet actions', async () => {
@@ -628,7 +753,7 @@ describe('Fill Actor page', () => {
     const user = userEvent.setup()
     const fetchMock = vi.mocked(fetch)
     fetchMock
-      .mockImplementationOnce(() => jsonResponse({ status: 'ok' }))
+      .mockImplementationOnce(() => jsonResponse({ status: 'ok', apply_enabled: true, apply_ready: true }))
       .mockImplementationOnce(() => jsonResponse(plan))
       .mockImplementationOnce(() => jsonResponse({ error: { code: 'expired_plan' } }, 410))
 
@@ -640,6 +765,27 @@ describe('Fill Actor page', () => {
     await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认移入' }))
 
     await waitFor(() => expect(screen.getByText('扫描结果已失效')).toBeInTheDocument())
+    expect(screen.getByRole('button', { name: /重新扫描/ })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '确认并移入' })).toBeDisabled()
+  })
+
+  it('requires a rescan when apply rejects a legacy plan', async () => {
+    const user = userEvent.setup()
+    const fetchMock = vi.mocked(fetch)
+    fetchMock
+      .mockImplementationOnce(() => jsonResponse({ status: 'ok', apply_enabled: true, apply_ready: true }))
+      .mockImplementationOnce(() => jsonResponse(plan))
+      .mockImplementationOnce(() => jsonResponse({ error: { code: 'legacy_plan_requires_rescan' } }, 409))
+
+    render(<App />)
+    await user.type(screen.getByLabelText('演员 ID'), 'A123')
+    await user.click(screen.getByRole('button', { name: '开始扫描' }))
+    await screen.findByText('扫描结果')
+    await user.click(screen.getByRole('button', { name: '确认并移入' }))
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认移入' }))
+
+    expect(await screen.findByText('该计划来自旧版本，请重新扫描后再操作。')).toBeInTheDocument()
+    expect(screen.getByText('扫描结果已失效')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /重新扫描/ })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '确认并移入' })).toBeDisabled()
   })

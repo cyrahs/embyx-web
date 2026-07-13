@@ -14,6 +14,7 @@ from embyx_web.fill_actor import (
     FillActorPaths,
     FillActorService,
     InvalidActorIdError,
+    MoveDisabledError,
     MoveState,
     RevisionMismatchError,
     TooManyActorsError,
@@ -114,6 +115,7 @@ def make_service(
     clock: MutableClock | None = None,
     max_actors: int = 20,
     move_in_by_brand: bool = False,
+    apply_enabled: bool = True,
 ) -> tuple[FillActorService, FakeMagnetProvider]:
     magnet_provider = FakeMagnetProvider(magnets)
     return (
@@ -126,6 +128,7 @@ def make_service(
             token_factory=TokenFactory(),
             max_actors=max_actors,
             move_in_by_brand=move_in_by_brand,
+            apply_enabled=apply_enabled,
         ),
         magnet_provider,
     )
@@ -466,16 +469,54 @@ async def create_move_plan(
     *,
     video_id: str = 'ABC-001',
     move_in_by_brand: bool = False,
+    apply_enabled: bool = True,
 ):
     service, _ = make_service(
         paths,
         catalog={'actor': [video_id]},
         brands={video_id: 'ABC'},
         move_in_by_brand=move_in_by_brand,
+        apply_enabled=apply_enabled,
     )
     plan = await service.create_plan(['actor'])
     candidate = plan.videos[0].move_candidates[0]
     return service, plan, candidate
+
+
+@pytest.mark.asyncio
+async def test_disabled_apply_does_not_change_scan_results(paths: FillActorPaths) -> None:
+    source = create_move_candidate(paths)
+    service, plan, candidate = await create_move_plan(paths, apply_enabled=False)
+
+    assert plan.videos[0].move_candidates == (candidate,)
+    assert service.apply_enabled is False
+    with pytest.raises(MoveDisabledError):
+        await service.apply(
+            plan_id=plan.plan_id,
+            revision=plan.revision,
+            candidate_ids=[candidate.candidate_id],
+        )
+
+    assert source.read_bytes() == b'video'
+    assert not (paths.move_in_path / source.name).exists()
+
+
+@pytest.mark.asyncio
+async def test_disabled_apply_does_not_affect_magnet_lookup(paths: FillActorPaths) -> None:
+    service, magnet_provider = make_service(
+        paths,
+        catalog={'actor': ['ABC-001']},
+        brands={'ABC-001': 'ABC'},
+        magnets={'ABC-001': 'magnet:?xt=urn:btih:abc'},
+        apply_enabled=False,
+    )
+
+    plan = await service.create_plan(['actor'])
+
+    assert service.apply_enabled is False
+    assert magnet_provider.calls == ['ABC-001']
+    assert plan.videos[0].state is VideoState.MAGNET_FOUND
+    assert plan.videos[0].magnet == 'magnet:?xt=urn:btih:abc'
 
 
 @pytest.mark.asyncio

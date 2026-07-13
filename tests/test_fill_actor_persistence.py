@@ -357,6 +357,7 @@ def test_sqlite_repository_applies_explicit_schema_migration(tmp_path: Path) -> 
         'schema_migrations',
         'plans',
         'candidates',
+        'cloud_move_operations',
         'move_results',
         'jobs',
         'job_feeds',
@@ -381,6 +382,18 @@ def test_sqlite_repository_migrates_v2_jobs_with_compatible_progress(tmp_path: P
                 job_id TEXT PRIMARY KEY, operation TEXT NOT NULL, state TEXT NOT NULL,
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL, plan_id TEXT, error_code TEXT,
                 owner_id TEXT, lease_expires_at TEXT, actor_ids_json TEXT NOT NULL DEFAULT '[]'
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE candidates (
+                plan_id TEXT NOT NULL, candidate_id TEXT NOT NULL, video_id TEXT NOT NULL,
+                source_path TEXT NOT NULL, source_root TEXT NOT NULL, destination_path TEXT NOT NULL,
+                fingerprint_device INTEGER NOT NULL, fingerprint_inode INTEGER NOT NULL,
+                fingerprint_size INTEGER NOT NULL, fingerprint_mtime_ns INTEGER NOT NULL,
+                fingerprint_ctime_ns INTEGER NOT NULL,
+                PRIMARY KEY (plan_id, candidate_id)
             )
             """
         )

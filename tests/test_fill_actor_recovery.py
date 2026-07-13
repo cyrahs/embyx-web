@@ -35,6 +35,7 @@ def make_service(
     repository: SQLiteFillActorRepository,
     *,
     root_sentinel: str | None = None,
+    apply_enabled: bool = True,
 ) -> tuple[FillActorService, FillActorPaths]:
     paths = FillActorPaths.from_iterable(
         actor_brand_path=tmp_path / 'actor',
@@ -53,6 +54,7 @@ def make_service(
         repository=repository,
         mutation_lock=AsyncFileLock(tmp_path / 'move.lock'),
         root_sentinel=root_sentinel,
+        apply_enabled=apply_enabled,
     )
     return service, paths
 
@@ -109,6 +111,37 @@ async def test_startup_reconciles_each_move_journal_state(
     journal = await restarted_repository.get_move_journal(plan.plan_id, candidate.candidate_id)
     assert journal is not None
     assert journal.state is MoveJournalState.RECONCILED
+
+
+@pytest.mark.asyncio
+async def test_disabled_apply_leaves_unreconciled_move_untouched(tmp_path: Path) -> None:
+    database = tmp_path / 'state' / 'app.sqlite3'
+    repository = SQLiteFillActorRepository(database)
+    service, paths = make_service(tmp_path, repository)
+    brand_path = paths.additional_brand_paths[0] / 'ABC'
+    brand_path.mkdir()
+    source = brand_path / 'ABC-001.mp4'
+    source.write_bytes(b'video')
+    plan = await service.create_plan(['actor'])
+    candidate = plan.videos[0].move_candidates[0]
+    await repository.save_move_journal(
+        MoveJournalRecord(
+            plan_id=plan.plan_id,
+            candidate_id=candidate.candidate_id,
+            state=MoveJournalState.PREPARED,
+            updated_at=datetime.now(UTC),
+        )
+    )
+
+    restarted_repository = SQLiteFillActorRepository(database)
+    restarted, _ = make_service(tmp_path, restarted_repository, apply_enabled=False)
+
+    assert await restarted.reconcile_moves() == ()
+    assert source.read_bytes() == b'video'
+    assert not (paths.move_in_path / source.name).exists()
+    journal = await restarted_repository.get_move_journal(plan.plan_id, candidate.candidate_id)
+    assert journal is not None
+    assert journal.state is MoveJournalState.PREPARED
 
 
 @pytest.mark.asyncio

@@ -16,6 +16,10 @@ def test_settings_use_explicit_non_secret_runtime_paths(monkeypatch: pytest.Monk
     monkeypatch.setenv('EMBYX_WEB_MOVE_IN_ROOT', str(tmp_path / 'move-in'))
     monkeypatch.setenv('EMBYX_WEB_RUNTIME_ROOT', str(tmp_path / 'runtime'))
     monkeypatch.setenv('EMBYX_WEB_MOVE_IN_BY_BRAND', 'true')
+    monkeypatch.setenv('EMBYX_WEB_APPLY_ENABLED', 'true')
+    monkeypatch.setenv('EMBYX_WEB_CLOUD_STRM_MOUNT_PREFIX', '/mounted-cloud')
+    monkeypatch.setenv('EMBYX_WEB_CLOUD_SOURCE_ROOTS', '/cloud/library/additional-1:/cloud/library/additional-2')
+    monkeypatch.setenv('EMBYX_WEB_CLOUD_MOVE_IN_ROOT', '/cloud/library/destination')
     monkeypatch.setenv('EMBYX_WEB_RSSHUB_URL', 'http://rsshub.internal.test/')
     monkeypatch.setenv('EMBYX_WEB_FRESHRSS_URL', 'https://freshrss.example.test/')
     monkeypatch.setenv('EMBYX_WEB_FRESHRSS_RSSHUB_URL', 'https://rsshub.example.test/')
@@ -28,6 +32,12 @@ def test_settings_use_explicit_non_secret_runtime_paths(monkeypatch: pytest.Monk
     assert settings.move_in_path == tmp_path / 'move-in'
     assert settings.embyx_runtime_path == tmp_path / 'runtime'
     assert settings.move_in_by_brand is True
+    assert settings.apply_enabled is True
+    assert settings.cloud_move_paths is not None
+    assert tuple(map(str, settings.cloud_move_paths.source_api_roots)) == (
+        '/cloud/library/additional-1',
+        '/cloud/library/additional-2',
+    )
     assert settings.rsshub_url == 'http://rsshub.internal.test'
     assert settings.freshrss_url == 'https://freshrss.example.test'
     assert settings.freshrss_rsshub_url == 'https://rsshub.example.test'
@@ -50,6 +60,29 @@ def test_feed_integration_urls_default_to_disabled_and_empty_values_disable_them
     assert settings.rsshub_url is None
     assert settings.freshrss_url is None
     assert settings.freshrss_rsshub_url is None
+
+
+def test_apply_defaults_to_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv('EMBYX_WEB_APPLY_ENABLED', raising=False)
+
+    assert Settings.from_env().apply_enabled is False
+
+
+def test_apply_cannot_enable_legacy_local_file_moves(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv('EMBYX_WEB_APPLY_ENABLED', 'true')
+
+    with pytest.raises(ValueError, match='requires the CloudDrive'):
+        Settings.from_env()
+
+
+def test_cloud_roots_must_be_complete_and_match_additional_roots(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv('EMBYX_WEB_ADDITIONAL_ROOTS', '/mapping/a:/mapping/b')
+    monkeypatch.setenv('EMBYX_WEB_CLOUD_STRM_MOUNT_PREFIX', '/mounted-cloud')
+    monkeypatch.setenv('EMBYX_WEB_CLOUD_SOURCE_ROOTS', '/cloud/library/a')
+    monkeypatch.setenv('EMBYX_WEB_CLOUD_MOVE_IN_ROOT', '/cloud/library/destination')
+
+    with pytest.raises(ValueError, match='one-for-one'):
+        Settings.from_env()
 
 
 @pytest.mark.parametrize(

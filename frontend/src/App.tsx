@@ -27,7 +27,7 @@ import type {
 
 const ACTOR_ID = /^[A-Za-z0-9_-]{1,32}$/
 const MAX_ACTORS = 20
-const STALE_CODES = new Set(['expired_plan', 'revision_mismatch', 'unknown_plan'])
+const STALE_CODES = new Set(['expired_plan', 'revision_mismatch', 'unknown_plan', 'legacy_plan_requires_rescan'])
 const BUSINESS_PROGRESS_WARNING_SECONDS = 60
 const HEARTBEAT_WARNING_SECONDS = 35
 
@@ -95,6 +95,15 @@ const MOVE_LABELS = {
   failed: '移动失败',
 } as const
 
+const MOVE_ERROR_LABELS: Record<string, string> = {
+  cloud_move_status_unknown: '远端状态待确认，请勿重复操作',
+  cloud_move_in_progress: '已有移动正在核验',
+  cloud_destination_missing: '无法准备目标目录',
+  cloud_destination_exists: '目标位置已有文件',
+  cloud_source_changed: '远端源文件已变化',
+  strm_target_changed: '映射目标已变化，请重新扫描',
+}
+
 function parseActorIds(value: string) {
   const values = value
     .split(/[\s,，;；]+/)
@@ -156,7 +165,14 @@ function planMagnets(plan: FillActorPlan | null): string[] {
 }
 
 function errorMessage(error: unknown): string {
-  if (error instanceof ApiError) return error.message
+  if (error instanceof ApiError) {
+    const messages: Record<string, string> = {
+      move_disabled: '文件移动当前由管理员暂停。',
+      legacy_plan_requires_rescan: '该计划来自旧版本，请重新扫描后再操作。',
+      not_ready: '移动依赖尚未就绪，请稍后重试。',
+    }
+    return messages[error.code] ?? error.message
+  }
   return '操作未能完成，请稍后重试。'
 }
 
@@ -252,23 +268,54 @@ export default function App() {
   const magnets = useMemo(() => planMagnets(plan), [plan])
   const selectedCandidates = [...selected].map((id) => candidates.get(id)).filter(Boolean) as MoveCandidate[]
   const planExpired = Boolean(plan && new Date(plan.expires_at).getTime() <= now)
+  const applyVerificationPending = Boolean(
+    applyResult?.results.some((item) => item.error_code === 'cloud_move_status_unknown'),
+  )
   const jobPending = isJobPending(job)
   const jobCancelled = isJobCancelled(job)
   const feedsPending = feeds.some((feed) => feed.state === 'queued' || feed.state === 'warming')
   const envelopePending = jobPending || feedsPending
   const healthReady = Boolean(health && ['ok', 'healthy', 'ready'].includes(health.status.toLowerCase()))
+  const applyEnabled = health?.apply_ready === true
+  const applyNotice = !health || applyEnabled
+    ? null
+    : health.apply_enabled === false
+      ? {
+          title: '文件移动已暂停',
+          body: '当前仅支持扫描、磁力查询和订阅操作；确认移入功能已由管理员关闭。',
+        }
+      : health.legacy_journal === false
+        ? {
+            title: '文件移动等待管理员处理',
+            body: '检测到旧版本未完成的移动记录。为避免误动派生映射文件，新的移入已被阻止。',
+          }
+        : {
+            title: '文件移动尚未就绪',
+            body: health.cloud === false
+              ? 'CloudDrive 连接或授权尚未就绪，当前不会提交移动。'
+              : '文件移动依赖尚未就绪，请稍后重试。',
+          }
 
   useEffect(() => {
     let mounted = true
-    void getHealth()
-      .then((value) => {
-        if (mounted) setHealth(value)
-      })
-      .catch(() => {
-        if (mounted) setHealthFailed(true)
-      })
+    const refresh = () => {
+      void getHealth()
+        .then((value) => {
+          if (!mounted) return
+          setHealth(value)
+          setHealthFailed(false)
+        })
+        .catch(() => {
+          if (!mounted) return
+          setHealth(null)
+          setHealthFailed(true)
+        })
+    }
+    refresh()
+    const timer = window.setInterval(refresh, 30_000)
     return () => {
       mounted = false
+      window.clearInterval(timer)
     }
   }, [])
 
@@ -425,7 +472,7 @@ export default function App() {
   }
 
   async function confirmApply() {
-    if (!plan || !selected.size) return
+    if (!applyEnabled || !plan || !selected.size) return
     setConfirmOpen(false)
     setApplying(true)
     setError(null)
@@ -436,6 +483,9 @@ export default function App() {
     } catch (applyError) {
       if (applyError instanceof ApiError && applyError.code === 'unauthorized') setAuthRequired(true)
       if (applyError instanceof ApiError && STALE_CODES.has(applyError.code)) setNeedsFreshPlan(true)
+      if (applyError instanceof ApiError && applyError.code === 'move_disabled') {
+        setHealth((current) => current ? { ...current, apply_enabled: false, apply_ready: false } : current)
+      }
       setError(errorMessage(applyError))
     } finally {
       setApplying(false)
@@ -620,6 +670,14 @@ export default function App() {
 
             {applyResult && <ApplySummary result={applyResult} />}
 
+            {applyNotice && (
+              <Notice
+                tone="warning"
+                title={applyNotice.title}
+                body={applyNotice.body}
+              />
+            )}
+
             <div className="action-dock">
               <div>
                 <span>已选择</span>
@@ -629,8 +687,15 @@ export default function App() {
               <button
                 className="button primary"
                 type="button"
-                disabled={!selected.size || applying || needsFreshPlan || planExpired}
-                onClick={() => setConfirmOpen(true)}
+                disabled={
+                  !applyEnabled
+                  || !selected.size
+                  || applying
+                  || needsFreshPlan
+                  || planExpired
+                  || applyVerificationPending
+                }
+                onClick={() => applyEnabled && setConfirmOpen(true)}
               >
                 {applying ? <Spinner /> : <MoveIcon />}
                 {applying ? '正在移入' : applyResult ? '再次应用选择' : '确认并移入'}
@@ -640,7 +705,7 @@ export default function App() {
         )}
       </main>
 
-      {confirmOpen && (
+      {confirmOpen && applyEnabled && (
         <div className="dialog-backdrop" role="presentation" onMouseDown={() => setConfirmOpen(false)}>
           <div className="dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-title" onMouseDown={(event) => event.stopPropagation()}>
             <span className="dialog-icon"><MoveIcon /></span>
@@ -931,7 +996,11 @@ function VideoRow({
                 <small>{candidate.source_label}</small>
               </span>
               {candidate.destination_conflict && <span className="warning-pill"><AlertIcon />目标位置已有同名文件</span>}
-              {result && <span className={`result-pill result-${result.state}`}>{MOVE_LABELS[result.state]}</span>}
+              {result && (
+                <span className={`result-pill result-${result.state}`}>
+                  {(result.error_code && MOVE_ERROR_LABELS[result.error_code]) ?? MOVE_LABELS[result.state]}
+                </span>
+              )}
             </label>
           )
         })}
@@ -951,12 +1020,13 @@ function VideoRow({
 function ApplySummary({ result }: { result: ApplyResult }) {
   const moved = result.results.filter((item) => item.state === 'moved').length
   const failed = result.results.length - moved
+  const unknown = result.results.some((item) => item.error_code === 'cloud_move_status_unknown')
   return (
     <section className={`apply-summary ${failed ? 'has-errors' : ''}`} aria-live="polite">
       <span className="apply-icon">{failed ? <AlertIcon /> : <CheckIcon />}</span>
       <div>
-        <strong>{failed ? '文件处理完成，部分项目需要注意' : '所选文件已全部移入'}</strong>
-        <p>{moved} 个成功{failed ? `，${failed} 个未移动。失败项目已在列表中标记。` : '。可继续选择其他文件或重新扫描。'}</p>
+        <strong>{unknown ? '部分远端状态仍在核验' : failed ? '文件处理完成，部分项目需要注意' : '所选文件已全部移入'}</strong>
+        <p>{moved} 个成功{unknown ? `，${failed} 个状态未知；系统只会观察，不会自动重复移动。` : failed ? `，${failed} 个未移动。失败项目已在列表中标记。` : '。可继续选择其他文件或重新扫描。'}</p>
       </div>
     </section>
   )
