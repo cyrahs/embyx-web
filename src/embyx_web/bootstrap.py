@@ -45,6 +45,7 @@ def build_app(settings: Settings) -> FastAPI:
             repository=repository,
             rsshub_url=settings.rsshub_url,
             freshrss_url=settings.freshrss_url,
+            freshrss_rsshub_url=settings.freshrss_rsshub_url,
         )
         if settings.rsshub_url is not None
         else None
@@ -59,4 +60,6 @@ def build_app(settings: Settings) -> FastAPI:
         max_request_bytes=settings.max_request_bytes,
         runtime_close=runtime.aclose,
         frontend_dist=frontend_dist,
+        freshrss_url=settings.freshrss_url,
+        freshrss_rsshub_url=settings.freshrss_rsshub_url,
     )

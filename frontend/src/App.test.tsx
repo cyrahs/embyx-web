@@ -2,6 +2,7 @@ import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
+import { normalizePlanEnvelope } from './api'
 import type { FillActorPlan } from './types'
 
 const plan: FillActorPlan = {
@@ -307,6 +308,7 @@ describe('Fill Actor page', () => {
       updated_at: '2026-07-13T10:01:00Z',
       error_code: null,
       freshrss_add_url: 'https://freshrss.example/i/?c=feed&a=add',
+      freshrss_url: 'https://freshrss.example/',
     }
     const readyFeed = {
       ...warmingFeed,
@@ -322,6 +324,7 @@ describe('Fill Actor page', () => {
       updated_at: '2026-07-13T10:02:00Z',
       error_code: 'rsshub_timeout',
       freshrss_add_url: null,
+      freshrss_url: null,
     }
     fetchMock
       .mockImplementationOnce(() => jsonResponse({ status: 'ok' }))
@@ -343,11 +346,16 @@ describe('Fill Actor page', () => {
     expect(await screen.findByText('缓存预热中')).toBeInTheDocument()
     expect(screen.getByText('RSSHub 正在预热缓存，页面会自动更新。')).toBeInTheDocument()
     expect(screen.queryByRole('link', { name: '一键添加到 FreshRSS' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: '打开 FreshRSS' })).not.toBeInTheDocument()
 
     const addLink = await screen.findByRole('link', { name: '一键添加到 FreshRSS' }, { timeout: 2_000 })
+    const freshrssLink = screen.getByRole('link', { name: '打开 FreshRSS' })
     expect(addLink).toHaveAttribute('href', readyFeed.freshrss_add_url)
     expect(addLink).toHaveAttribute('target', '_blank')
     expect(addLink).toHaveAttribute('rel', 'noopener noreferrer')
+    expect(freshrssLink).toHaveAttribute('href', readyFeed.freshrss_url)
+    expect(freshrssLink).toHaveAttribute('target', '_blank')
+    expect(freshrssLink).toHaveAttribute('rel', 'noopener noreferrer')
     expect(screen.getByText('缓存已就绪')).toBeInTheDocument()
     expect(screen.getByText('缓存失败')).toBeInTheDocument()
     expect(screen.getByText('错误：rsshub_timeout')).toBeInTheDocument()
@@ -358,6 +366,51 @@ describe('Fill Actor page', () => {
       expect.objectContaining({ cache: 'no-store', signal: expect.any(AbortSignal) }),
     )
     expect(fetchMock).toHaveBeenCalledTimes(3)
+  })
+
+  it('hides unsafe FreshRSS actions even when the feed is ready', async () => {
+    const user = userEvent.setup()
+    const fetchMock = vi.mocked(fetch)
+    fetchMock
+      .mockImplementationOnce(() => jsonResponse({ status: 'ok' }))
+      .mockImplementationOnce(() => jsonResponse({
+        job: { job_id: 'job-1', plan_id: 'plan-1', state: 'completed' },
+        plan,
+        feeds: [{
+          actor_id: 'A123',
+          state: 'ready',
+          attempts: 2,
+          updated_at: '2026-07-13T10:02:00Z',
+          error_code: null,
+          freshrss_add_url: 'javascript:alert(1)',
+          freshrss_url: 'data:text/html,unsafe',
+        }],
+      }))
+
+    render(<App />)
+    await user.type(screen.getByLabelText('演员 ID'), 'A123')
+    await user.click(screen.getByRole('button', { name: '开始扫描' }))
+
+    expect(await screen.findByText('缓存已就绪')).toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: '一键添加到 FreshRSS' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: '打开 FreshRSS' })).not.toBeInTheDocument()
+  })
+
+  it('normalizes old feed responses without a FreshRSS site URL', () => {
+    const oldFeed = {
+      actor_id: 'A123',
+      state: 'ready',
+      attempts: 2,
+      updated_at: '2026-07-13T10:02:00Z',
+      error_code: null,
+      freshrss_add_url: 'https://freshrss.example/i/?c=feed&a=add',
+    }
+
+    expect(normalizePlanEnvelope({
+      job: { job_id: 'job-1', plan_id: 'plan-1', state: 'completed' },
+      plan: null,
+      feeds: [oldFeed],
+    }).feeds).toEqual([{ ...oldFeed, freshrss_url: null }])
   })
 
   it('shows an explicit recovery action when apply reports an expired plan', async () => {

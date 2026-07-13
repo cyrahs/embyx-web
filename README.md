@@ -67,8 +67,9 @@ The production bootstrap reads only explicit `EMBYX_WEB_*` variables:
 | `EMBYX_WEB_MAX_REQUEST_BYTES` | Maximum mutation body | `65536` |
 | `EMBYX_WEB_MAX_ACTORS` / `EMBYX_WEB_MAX_VIDEOS` | Per-plan limits | `20` / `2000` |
 | `EMBYX_WEB_MAGNET_CONCURRENCY` | Process-wide lookup concurrency | `8` |
-| `EMBYX_WEB_RSSHUB_URL` | Cluster-local RSSHub base URL used to prewarm actor feeds; set empty to disable | `http://rsshub.rss.svc.cluster.local` |
-| `EMBYX_WEB_FRESHRSS_URL` | FreshRSS browser base URL used to build the prefilled add-subscription action | disabled |
+| `EMBYX_WEB_RSSHUB_URL` | RSSHub base URL reachable from embyx-web and used to prewarm actor feeds | disabled |
+| `EMBYX_WEB_FRESHRSS_URL` | Browser-facing FreshRSS base URL used for the site and add-subscription actions | disabled |
+| `EMBYX_WEB_FRESHRSS_RSSHUB_URL` | RSSHub base URL reachable from FreshRSS and embedded in `url_rss` | disabled |
 
 Create the sentinel deliberately in the actual mounted filesystem of the actor root, every additional root, and the
 move-in root. A missing marker makes readiness fail and prevents scanning/reconciliation, protecting against an empty
@@ -118,8 +119,10 @@ queued/running jobs per process configuration.
 When RSSHub integration is enabled, each scan schedules the cluster-local `/javbus/star/{actor-id}` request before
 actor catalog scanning begins. A background `HEAD` probe waits for a successful XML response carrying
 `RSSHub-Cache-Status: HIT`; cache failures do not fail the library scan. Once ready, the UI builds FreshRSS's standard
-prefilled add-feed URL from `EMBYX_WEB_FRESHRSS_URL`. The user remains inside FreshRSS's normal authenticated and CSRF
-protected confirmation flow, so embyx-web never stores FreshRSS credentials.
+prefilled add-feed URL from `EMBYX_WEB_FRESHRSS_URL`, using `EMBYX_WEB_FRESHRSS_RSSHUB_URL` for the feed URL that
+FreshRSS itself resolves. It also exposes the configured FreshRSS site as a separate action. Deployment-specific URLs
+must be injected through environment variables rather than committed as application defaults. The user remains inside
+FreshRSS's normal authenticated and CSRF-protected confirmation flow, so embyx-web never stores FreshRSS credentials.
 
 ## Frontend and packaging
 

@@ -1,8 +1,10 @@
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
+from embyx_web import bootstrap
 from embyx_web.bootstrap import build_app
 from embyx_web.settings import Settings
 
@@ -54,3 +56,58 @@ async def aclose():
         assert response.status_code == 202
 
     assert sys.modules['bootstrap_runtime.api'].closed is True
+
+
+def test_bootstrap_passes_feed_integration_urls_to_warmer_and_api(monkeypatch, tmp_path: Path) -> None:
+    captured: dict[str, dict] = {}
+    warmer = object()
+    jobs = object()
+    app = object()
+
+    async def runtime_close() -> None:
+        return None
+
+    runtime = SimpleNamespace(
+        actor_catalog=object(),
+        magnet_provider=object(),
+        brand_resolver=object(),
+        aclose=runtime_close,
+    )
+
+    def make_warmer(**kwargs):
+        captured['warmer'] = kwargs
+        return warmer
+
+    def make_jobs(**kwargs):
+        captured['jobs'] = kwargs
+        return jobs
+
+    def make_app(**kwargs):
+        captured['api'] = kwargs
+        return app
+
+    monkeypatch.setattr(bootstrap, 'load_runtime_adapters', lambda **_kwargs: runtime)
+    monkeypatch.setattr(bootstrap, 'RSSHubFeedWarmer', make_warmer)
+    monkeypatch.setattr(bootstrap, 'FillActorJobManager', make_jobs)
+    monkeypatch.setattr(bootstrap, 'create_app', make_app)
+
+    settings = Settings(
+        database_path=tmp_path / 'state' / 'app.sqlite3',
+        mutation_lock_path=tmp_path / 'state' / 'move.lock',
+        actor_brand_path=tmp_path / 'actor',
+        additional_brand_paths=(tmp_path / 'additional',),
+        move_in_path=tmp_path / 'move-in',
+        embyx_runtime_path=tmp_path / 'runtime',
+        rsshub_url='http://rsshub.internal.test',
+        freshrss_url='https://freshrss.example.test',
+        freshrss_rsshub_url='https://rsshub.example.test',
+    )
+
+    assert build_app(settings) is app
+    assert captured['warmer']['rsshub_url'] == settings.rsshub_url
+    assert captured['warmer']['freshrss_url'] == settings.freshrss_url
+    assert captured['warmer']['freshrss_rsshub_url'] == settings.freshrss_rsshub_url
+    assert captured['jobs']['feed_warmer'] is warmer
+    assert captured['api']['jobs'] is jobs
+    assert captured['api']['freshrss_url'] == settings.freshrss_url
+    assert captured['api']['freshrss_rsshub_url'] == settings.freshrss_rsshub_url

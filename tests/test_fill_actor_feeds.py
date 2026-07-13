@@ -89,11 +89,11 @@ async def claim_job(
 
 
 @pytest.mark.asyncio
-async def test_get_triggers_cache_then_head_hit_marks_ready_and_builds_freshrss_link() -> None:
-    methods: list[str] = []
+async def test_cache_probe_and_freshrss_subscription_use_independent_rsshub_bases() -> None:
+    requests: list[tuple[str, str]] = []
 
     async def handler(request: httpx2.Request) -> httpx2.Response:
-        methods.append(request.method)
+        requests.append((request.method, str(request.url)))
         return httpx2.Response(
             200,
             headers={
@@ -107,8 +107,9 @@ async def test_get_triggers_cache_then_head_hit_marks_ready_and_builds_freshrss_
     client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
     warmer = RSSHubFeedWarmer(
         repository=repository,
-        rsshub_url='http://rsshub.rss.svc.cluster.local',
-        freshrss_url='https://rss.s117.me',
+        rsshub_url='http://rsshub.internal.test',
+        freshrss_url='https://freshrss.example.test',
+        freshrss_rsshub_url='https://rsshub.example.test',
         client=client,
         poll_interval=0.001,
     )
@@ -118,15 +119,18 @@ async def test_get_triggers_cache_then_head_hit_marks_ready_and_builds_freshrss_
     await task
 
     feeds = await repository.list_job_feeds(claimed.job_id)
-    assert methods == ['GET', 'HEAD']
+    assert requests == [
+        ('GET', 'http://rsshub.internal.test/javbus/star/rw6'),
+        ('HEAD', 'http://rsshub.internal.test/javbus/star/rw6'),
+    ]
     assert feeds[0].state is JobFeedState.READY
     assert feeds[0].attempts == 2
     add_url = urlsplit(feeds[0].freshrss_add_url or '')
-    assert f'{add_url.scheme}://{add_url.netloc}{add_url.path}' == 'https://rss.s117.me/i/'
+    assert f'{add_url.scheme}://{add_url.netloc}{add_url.path}' == 'https://freshrss.example.test/i/'
     assert parse_qs(add_url.query) == {
         'c': ['feed'],
         'a': ['add'],
-        'url_rss': ['http://rsshub.rss.svc.cluster.local/javbus/star/rw6'],
+        'url_rss': ['https://rsshub.example.test/javbus/star/rw6'],
     }
     await client.aclose()
 
