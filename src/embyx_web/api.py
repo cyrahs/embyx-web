@@ -29,7 +29,14 @@ from embyx_web.fill_actor.errors import (
 )
 from embyx_web.fill_actor.jobs import FillActorJobManager
 from embyx_web.fill_actor.models import ApplyResult, FillActorPlan
-from embyx_web.fill_actor.persistence import FillActorRepository, JobProgress, JobRecord, JobStage, JobState
+from embyx_web.fill_actor.persistence import (
+    FillActorRepository,
+    JobFeedRecord,
+    JobProgress,
+    JobRecord,
+    JobStage,
+    JobState,
+)
 from embyx_web.fill_actor.service import FillActorService
 
 HTTP_UNAUTHORIZED = 401
@@ -126,9 +133,30 @@ class JobView(BaseModel):
         )
 
 
-class PlanJobResponse(BaseModel):
+class ActorFeedView(BaseModel):
+    actor_id: str
+    state: str
+    attempts: int
+    updated_at: datetime
+    error_code: str | None
+    freshrss_add_url: str | None
+
+    @classmethod
+    def from_record(cls, record: JobFeedRecord) -> 'ActorFeedView':
+        return cls(
+            actor_id=record.actor_id,
+            state=record.state.value,
+            attempts=record.attempts,
+            updated_at=record.updated_at,
+            error_code=record.error_code.value if record.error_code is not None else None,
+            freshrss_add_url=record.freshrss_add_url,
+        )
+
+
+class PlanEnvelope(BaseModel):
     job: JobView
     plan: FillActorPlan | None
+    feeds: tuple[ActorFeedView, ...]
 
 
 class ApiError(Exception):
@@ -269,12 +297,17 @@ def create_app(  # noqa: C901, PLR0913, PLR0915
         status_code=202,
         dependencies=[Depends(require_mutation_auth), Depends(require_ready)],
     )
-    async def create_plan(request: CreatePlanRequest) -> PlanJobResponse:
+    async def create_plan(request: CreatePlanRequest) -> PlanEnvelope:
         job = await jobs.start_plan(request.actor_ids)
-        return PlanJobResponse(job=JobView.from_record(job), plan=None)
+        feeds = await jobs.get_feeds(job.job_id)
+        return PlanEnvelope(
+            job=JobView.from_record(job),
+            plan=None,
+            feeds=tuple(ActorFeedView.from_record(feed) for feed in feeds),
+        )
 
     @app.get('/api/fill-actor/plans/{plan_id}')
-    async def get_plan(plan_id: str) -> PlanJobResponse:
+    async def get_plan(plan_id: str) -> PlanEnvelope:
         job = await jobs.get_job(plan_id)
         if job is None:
             raise UnknownPlanError(plan_id)
@@ -283,7 +316,12 @@ def create_app(  # noqa: C901, PLR0913, PLR0915
             raise UnknownPlanError(plan_id)
         if plan is None and job.plan_id is None and job.error_code is None:
             raise UnknownPlanError(plan_id)
-        return PlanJobResponse(job=JobView.from_record(job), plan=plan)
+        feeds = await jobs.get_feeds(plan_id)
+        return PlanEnvelope(
+            job=JobView.from_record(job),
+            plan=plan,
+            feeds=tuple(ActorFeedView.from_record(feed) for feed in feeds),
+        )
 
     @app.post(
         '/api/fill-actor/plans/{plan_id}/apply',

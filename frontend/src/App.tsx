@@ -12,6 +12,7 @@ import {
   type HealthStatus,
 } from './api'
 import type {
+  ActorFeedStatus,
   ApplyResult,
   FillActorPlan,
   JobProgress,
@@ -28,6 +29,13 @@ const MAX_ACTORS = 20
 const STALE_CODES = new Set(['expired_plan', 'revision_mismatch', 'unknown_plan'])
 const BUSINESS_PROGRESS_WARNING_SECONDS = 60
 const HEARTBEAT_WARNING_SECONDS = 35
+
+const FEED_STATE_LABELS = {
+  queued: '等待缓存',
+  warming: '缓存预热中',
+  ready: '缓存已就绪',
+  failed: '缓存失败',
+} as const
 
 const STAGE_LABELS: Record<string, string> = {
   queued: '任务已排队',
@@ -119,6 +127,29 @@ function safeMagnet(magnet: string | null): string | null {
   }) ? magnet : null
 }
 
+function safeFreshRssUrl(value: string | null): string | null {
+  if (!value) return null
+  try {
+    const url = new URL(value)
+    return url.protocol === 'https:' || url.protocol === 'http:' ? value : null
+  } catch {
+    return null
+  }
+}
+
+function planMagnets(plan: FillActorPlan | null): string[] {
+  const seen = new Set<string>()
+  const magnets: string[] = []
+  plan?.videos.forEach((video) => {
+    const magnet = safeMagnet(video.magnet)
+    if (magnet && !seen.has(magnet)) {
+      seen.add(magnet)
+      magnets.push(magnet)
+    }
+  })
+  return magnets
+}
+
 function errorMessage(error: unknown): string {
   if (error instanceof ApiError) return error.message
   return '操作未能完成，请稍后重试。'
@@ -188,6 +219,7 @@ export default function App() {
   const [health, setHealth] = useState<HealthStatus | null>(null)
   const [healthFailed, setHealthFailed] = useState(false)
   const [plan, setPlan] = useState<FillActorPlan | null>(null)
+  const [feeds, setFeeds] = useState<ActorFeedStatus[]>([])
   const [planId, setPlanId] = useState<string | null>(recoveredPlanId)
   const [job, setJob] = useState<PlanJob | null>(() => recoveredPlanId
     ? { plan_id: recoveredPlanId, state: 'running' }
@@ -200,15 +232,20 @@ export default function App() {
   const [applying, setApplying] = useState(false)
   const [applyResult, setApplyResult] = useState<ApplyResult | null>(null)
   const [needsFreshPlan, setNeedsFreshPlan] = useState(false)
-  const [copiedMagnet, setCopiedMagnet] = useState<string | null>(null)
+  const [copyingMagnets, setCopyingMagnets] = useState(false)
+  const [copiedRevision, setCopiedRevision] = useState<string | null>(null)
+  const [magnetCopyError, setMagnetCopyError] = useState<string | null>(null)
   const [now, setNow] = useState(Date.now())
   const lastAutoSelectedRevision = useRef<string | null>(null)
   const pollFailures = useRef(0)
   const parsed = useMemo(() => parseActorIds(input), [input])
   const candidates = useMemo(() => candidateMap(plan), [plan])
+  const magnets = useMemo(() => planMagnets(plan), [plan])
   const selectedCandidates = [...selected].map((id) => candidates.get(id)).filter(Boolean) as MoveCandidate[]
   const planExpired = Boolean(plan && new Date(plan.expires_at).getTime() <= now)
   const jobPending = isJobPending(job)
+  const feedsPending = feeds.some((feed) => feed.state === 'queued' || feed.state === 'warming')
+  const envelopePending = jobPending || feedsPending
   const healthReady = Boolean(health && ['ok', 'healthy', 'ready'].includes(health.status.toLowerCase()))
 
   useEffect(() => {
@@ -232,9 +269,9 @@ export default function App() {
   }, [jobPending])
 
   useEffect(() => {
-    if (planId && jobPending) setActivePlanId(planId)
+    if (planId && envelopePending) setActivePlanId(planId)
     else if (job || plan) setActivePlanId(null)
-  }, [job, jobPending, plan, planId])
+  }, [envelopePending, job, plan, planId])
 
   useEffect(() => {
     if (!plan || lastAutoSelectedRevision.current === plan.revision) return
@@ -246,7 +283,7 @@ export default function App() {
   }, [plan])
 
   useEffect(() => {
-    if (!planId || plan || !isJobPending(job) || authRequired) return
+    if (!planId || (!isJobPending(job) && !feedsPending) || authRequired) return
     const controller = new AbortController()
     const delay = Math.min(800 * 2 ** pollFailures.current, 10_000)
     const timer = window.setTimeout(() => {
@@ -254,7 +291,7 @@ export default function App() {
         .then((envelope) => {
           pollFailures.current = 0
           setPollWarning(null)
-          consumeEnvelope(envelope, setPlan, setPlanId, setJob, setError)
+          consumeEnvelope(envelope, setPlan, setPlanId, setJob, setFeeds, setError)
         })
         .catch((pollError: unknown) => {
           if (pollError instanceof DOMException && pollError.name === 'AbortError') return
@@ -275,7 +312,7 @@ export default function App() {
       window.clearTimeout(timer)
       controller.abort()
     }
-  }, [authRequired, job, plan, planId])
+  }, [authRequired, feedsPending, job, planId])
 
   async function startScan() {
     if (!parsed.actorIds.length || parsed.invalid.length || parsed.actorIds.length > MAX_ACTORS) return
@@ -284,15 +321,18 @@ export default function App() {
     setPollWarning(null)
     setActivePlanId(null)
     setPlan(null)
+    setFeeds([])
     setPlanId(null)
     setJob(null)
     setApplyResult(null)
     setSelected(new Set())
     setNeedsFreshPlan(false)
+    setCopiedRevision(null)
+    setMagnetCopyError(null)
     lastAutoSelectedRevision.current = null
     pollFailures.current = 0
     try {
-      consumeEnvelope(await createPlan(parsed.actorIds), setPlan, setPlanId, setJob, setError)
+      consumeEnvelope(await createPlan(parsed.actorIds), setPlan, setPlanId, setJob, setFeeds, setError)
     } catch (scanError) {
       if (scanError instanceof ApiError && scanError.code === 'unauthorized') setAuthRequired(true)
       setError(errorMessage(scanError))
@@ -329,15 +369,19 @@ export default function App() {
     }
   }
 
-  async function copyMagnet(magnet: string) {
-    const safe = safeMagnet(magnet)
-    if (!safe) return
+  async function copyAllMagnets() {
+    if (!magnets.length || copyingMagnets) return
+    setCopyingMagnets(true)
+    setMagnetCopyError(null)
     try {
-      await navigator.clipboard.writeText(safe)
-      setCopiedMagnet(safe)
-      window.setTimeout(() => setCopiedMagnet((current) => (current === safe ? null : current)), 1600)
+      await navigator.clipboard.writeText(magnets.join('\n'))
+      const revision = plan?.revision ?? null
+      setCopiedRevision(revision)
+      window.setTimeout(() => setCopiedRevision((current) => (current === revision ? null : current)), 1600)
     } catch {
-      setError('浏览器不允许访问剪贴板，请手动复制磁力链接。')
+      setMagnetCopyError('浏览器不允许访问剪贴板，请手动复制磁力链接。')
+    } finally {
+      setCopyingMagnets(false)
     }
   }
 
@@ -441,6 +485,8 @@ export default function App() {
           />
         )}
 
+        {feeds.length > 0 && <ActorFeeds feeds={feeds} />}
+
         {plan && (
           <>
             <PlanSummary plan={plan} />
@@ -450,8 +496,26 @@ export default function App() {
                   <span className="step-number">02</span>
                   <h2 id="results-title">扫描结果</h2>
                 </div>
-                <span className="result-total">共 {plan.videos.length} 部作品</span>
+                <div className="result-heading-actions">
+                  <span className="result-total">共 {plan.videos.length} 部作品</span>
+                  {magnets.length > 0 && (
+                    <button
+                      className="button secondary magnet-copy-button"
+                      type="button"
+                      disabled={copyingMagnets}
+                      onClick={() => void copyAllMagnets()}
+                    >
+                      {copyingMagnets ? <Spinner /> : copiedRevision === plan.revision ? <CheckIcon /> : <CopyIcon />}
+                      {copyingMagnets
+                        ? '正在复制'
+                        : copiedRevision === plan.revision
+                          ? `已复制 ${magnets.length} 个磁力`
+                          : `复制全部磁力（${magnets.length}）`}
+                    </button>
+                  )}
+                </div>
               </div>
+              {magnetCopyError && <p className="magnet-copy-error" role="alert">{magnetCopyError}</p>}
               <div className="group-stack">
                 {VIDEO_GROUPS.map((group) => {
                   const videos = plan.videos.filter((video) => video.state === group.state)
@@ -463,8 +527,6 @@ export default function App() {
                       videos={videos}
                       selected={selected}
                       toggleCandidate={toggleCandidate}
-                      copiedMagnet={copiedMagnet}
-                      copyMagnet={copyMagnet}
                       applyResult={applyResult}
                     />
                   )
@@ -601,10 +663,12 @@ function consumeEnvelope(
   setPlan: (plan: FillActorPlan | null) => void,
   setPlanId: (id: string | null) => void,
   setJob: (job: PlanJob | null) => void,
+  setFeeds: (feeds: ActorFeedStatus[]) => void,
   setError: (error: string | null) => void,
 ) {
   setPlanId(envelope.planId)
   setJob(envelope.job)
+  setFeeds(envelope.feeds)
   if (envelope.plan) setPlan(envelope.plan)
   const state = jobState(envelope.job)
   if ((state === 'failed' || state === 'partial_failed') && !envelope.plan) {
@@ -626,21 +690,65 @@ function PlanSummary({ plan }: { plan: FillActorPlan }) {
   )
 }
 
+function ActorFeeds({ feeds }: { feeds: ActorFeedStatus[] }) {
+  return (
+    <section className="feed-panel" aria-labelledby="feed-title">
+      <div className="feed-panel-heading">
+        <div>
+          <span className="feed-panel-icon"><FeedIcon /></span>
+          <div>
+            <h2 id="feed-title">RSSHub 缓存</h2>
+            <p>演员订阅源准备状态</p>
+          </div>
+        </div>
+        <span>{feeds.length} 位演员</span>
+      </div>
+      <ul className="feed-list">
+        {feeds.map((feed) => {
+          const freshrssUrl = feed.state === 'ready' ? safeFreshRssUrl(feed.freshrss_add_url) : null
+          return (
+            <li className={`feed-row feed-${feed.state}`} key={feed.actor_id}>
+              <div className="feed-actor">
+                <strong>{feed.actor_id}</strong>
+                <span>已尝试 {feed.attempts} 次 · {formatFeedUpdatedAt(feed.updated_at)}</span>
+              </div>
+              <span className="feed-state" role="status" aria-live="polite">
+                <FeedStateIcon state={feed.state} />{FEED_STATE_LABELS[feed.state]}
+              </span>
+              {feed.state === 'warming' && <p className="feed-detail">RSSHub 正在预热缓存，页面会自动更新。</p>}
+              {feed.state === 'failed' && (
+                <p className="feed-detail">{feed.error_code ? `错误：${feed.error_code}` : '缓存预热未能完成。'}</p>
+              )}
+              {freshrssUrl && (
+                <a className="button secondary freshrss-button" href={freshrssUrl} target="_blank" rel="noopener noreferrer">
+                  <ExternalIcon />一键添加到 FreshRSS
+                </a>
+              )}
+            </li>
+          )
+        })}
+      </ul>
+    </section>
+  )
+}
+
+function formatFeedUpdatedAt(value: string): string {
+  const timestamp = Date.parse(value)
+  if (!Number.isFinite(timestamp)) return '更新时间未知'
+  return `更新于 ${new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit' }).format(new Date(timestamp))}`
+}
+
 function VideoGroup({
   group,
   videos,
   selected,
   toggleCandidate,
-  copiedMagnet,
-  copyMagnet,
   applyResult,
 }: {
   group: (typeof VIDEO_GROUPS)[number]
   videos: VideoPlan[]
   selected: Set<string>
   toggleCandidate: (candidate: MoveCandidate) => void
-  copiedMagnet: string | null
-  copyMagnet: (magnet: string) => Promise<void>
   applyResult: ApplyResult | null
 }) {
   const [expanded, setExpanded] = useState(true)
@@ -660,8 +768,6 @@ function VideoGroup({
               video={video}
               selected={selected}
               toggleCandidate={toggleCandidate}
-              copiedMagnet={copiedMagnet}
-              copyMagnet={copyMagnet}
               applyResult={applyResult}
             />
           ))}
@@ -675,15 +781,11 @@ function VideoRow({
   video,
   selected,
   toggleCandidate,
-  copiedMagnet,
-  copyMagnet,
   applyResult,
 }: {
   video: VideoPlan
   selected: Set<string>
   toggleCandidate: (candidate: MoveCandidate) => void
-  copiedMagnet: string | null
-  copyMagnet: (magnet: string) => Promise<void>
   applyResult: ApplyResult | null
 }) {
   const magnet = safeMagnet(video.magnet)
@@ -718,10 +820,6 @@ function VideoRow({
         {magnet && (
           <div className="magnet-row">
             <span className="magnet-text" title={magnet}>{magnet}</span>
-            <button type="button" aria-label={`复制 ${video.video_id} 磁力链接`} onClick={() => void copyMagnet(magnet)}>
-              {copiedMagnet === magnet ? <CheckIcon /> : <CopyIcon />}{copiedMagnet === magnet ? '已复制' : '复制'}
-            </button>
-            <a href={magnet} aria-label={`打开 ${video.video_id} 磁力链接`} target="_blank" rel="noopener noreferrer"><OpenIcon />打开</a>
           </div>
         )}
         {!video.move_candidates.length && !magnet && !video.existing_files.length && (
@@ -764,7 +862,14 @@ function ChevronIcon({ expanded }: { expanded: boolean }) { return <svg classNam
 function CheckIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg> }
 function AlertIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 2.7 20h18.6L12 3Z"/><path d="M12 9v5m0 3h.01"/></svg> }
 function CopyIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg> }
-function OpenIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6m0-6-9 9"/><path d="M19 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h6"/></svg> }
+function ExternalIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6m0-6-9 9"/><path d="M19 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h6"/></svg> }
+function FeedIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5a14 14 0 0 1 14 14M5 11a8 8 0 0 1 8 8"/><circle cx="5" cy="19" r="1"/></svg> }
+function FeedStateIcon({ state }: { state: ActorFeedStatus['state'] }) {
+  if (state === 'ready') return <CheckIcon />
+  if (state === 'failed') return <AlertIcon />
+  if (state === 'warming') return <Spinner />
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 8v5l3 2"/></svg>
+}
 function FileIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v5h4"/></svg> }
 function StatusIcon({ state }: { state: VideoState }) {
   if (state === 'exists') return <CheckIcon />

@@ -1,4 +1,4 @@
-import type { ApplyResult, FillActorPlan, PlanEnvelope, PlanJob } from './types'
+import type { ActorFeedStatus, ApplyResult, FillActorPlan, PlanEnvelope, PlanJob } from './types'
 
 const API_TOKEN_KEY = 'embyx-web-api-token'
 const ACTIVE_PLAN_KEY = 'embyx-web-active-plan-id'
@@ -99,18 +99,32 @@ function looksLikeJob(value: unknown): value is PlanJob {
   )
 }
 
+function looksLikeActorFeedStatus(value: unknown): value is ActorFeedStatus {
+  if (!isRecord(value)) return false
+  return (
+    typeof value.actor_id === 'string' &&
+    ['queued', 'warming', 'ready', 'failed'].includes(String(value.state)) &&
+    typeof value.attempts === 'number' &&
+    Number.isFinite(value.attempts) &&
+    typeof value.updated_at === 'string' &&
+    (value.error_code === null || typeof value.error_code === 'string') &&
+    (value.freshrss_add_url === null || typeof value.freshrss_add_url === 'string')
+  )
+}
+
 export function normalizePlanEnvelope(value: unknown): PlanEnvelope {
-  if (looksLikePlan(value)) return { plan: value, job: null, planId: value.plan_id }
-  if (!isRecord(value)) return { plan: null, job: null, planId: null }
+  if (looksLikePlan(value)) return { plan: value, job: null, planId: value.plan_id, feeds: [] }
+  if (!isRecord(value)) return { plan: null, job: null, planId: null, feeds: [] }
 
   const plan = looksLikePlan(value.plan) ? value.plan : null
   const job = looksLikeJob(value.job) ? value.job : looksLikeJob(value) ? value : null
+  const feeds = Array.isArray(value.feeds) ? value.feeds.filter(looksLikeActorFeedStatus) : []
   const planId =
     plan?.plan_id ??
     (typeof value.plan_id === 'string' ? value.plan_id : null) ??
     (job && typeof job.plan_id === 'string' ? job.plan_id : null) ??
     (job && typeof job.id === 'string' ? job.id : null)
-  return { plan, job, planId }
+  return { plan, job, planId, feeds }
 }
 
 function normalizeApplyResult(value: unknown): ApplyResult {

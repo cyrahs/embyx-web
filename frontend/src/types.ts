@@ -9,6 +9,7 @@ export type VideoState =
 export type MoveState = 'moved' | 'stale' | 'conflict' | 'invalid_path' | 'failed'
 export type ApplyState = 'succeeded' | 'partial_failed' | 'failed'
 export type JobState = 'queued' | 'running' | 'completed' | 'partial_failed' | 'failed'
+export type ActorFeedState = 'queued' | 'warming' | 'ready' | 'failed'
 
 export interface ActorPlan {
   actor_id: string
@@ -83,8 +84,18 @@ export interface PlanJob {
   progress?: JobProgress | null
 }
 
+export interface ActorFeedStatus {
+  actor_id: string
+  state: ActorFeedState
+  attempts: number
+  updated_at: string
+  error_code: string | null
+  freshrss_add_url: string | null
+}
+
 export interface PlanEnvelope {
   plan: FillActorPlan | null
   job: PlanJob | null
   planId: string | null
+  feeds: ActorFeedStatus[]
 }

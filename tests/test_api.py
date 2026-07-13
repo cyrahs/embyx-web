@@ -4,10 +4,12 @@ import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import httpx2
 import pytest
 from fastapi.testclient import TestClient
 
 from embyx_web.api import JobProgressView, create_app
+from embyx_web.fill_actor.feeds import RSSHubFeedWarmer
 from embyx_web.fill_actor.jobs import FillActorJobManager
 from embyx_web.fill_actor.persistence import (
     JobProgress,
@@ -51,6 +53,7 @@ def make_client(
     api_token: str | None = None,
     max_request_bytes: int = 65_536,
     actor_catalog=None,
+    feed_warmer_factory=None,
 ) -> tuple[TestClient, FillActorPaths, MemoryFillActorRepository]:
     paths = FillActorPaths.from_iterable(
         actor_brand_path=tmp_path / 'actor',
@@ -67,7 +70,8 @@ def make_client(
         brand_resolver=BrandResolver(),
         repository=repository,
     )
-    jobs = FillActorJobManager(service=service, repository=repository)
+    feed_warmer = feed_warmer_factory(repository) if feed_warmer_factory is not None else None
+    jobs = FillActorJobManager(service=service, repository=repository, feed_warmer=feed_warmer)
     app = create_app(
         service=service,
         repository=repository,
@@ -121,6 +125,49 @@ def test_plan_job_and_apply_end_to_end(tmp_path: Path) -> None:
     assert applied.json()['results'][0]['state'] == 'moved'
     assert not source.exists()
     assert (paths.move_in_path / source.name).read_bytes() == b'video'
+
+
+def test_plan_envelope_exposes_persisted_feed_status_and_freshrss_action(tmp_path: Path) -> None:
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            200,
+            headers={'content-type': 'application/xml', 'rsshub-cache-status': 'HIT'},
+            content=b'<rss version="2.0"><channel /></rss>' if request.method == 'GET' else b'',
+        )
+
+    http_client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+
+    def feed_warmer_factory(repository):
+        return RSSHubFeedWarmer(
+            repository=repository,
+            rsshub_url='http://rsshub.rss.svc.cluster.local',
+            freshrss_url='https://rss.s117.me',
+            client=http_client,
+            poll_interval=0.001,
+        )
+
+    client, _, _ = make_client(tmp_path, feed_warmer_factory=feed_warmer_factory)
+    with client:
+        created = client.post('/api/fill-actor/plans', json={'actor_ids': ['actor']})
+        assert created.status_code == 202
+        assert created.json()['feeds'][0]['actor_id'] == 'actor'
+        plan_id = created.json()['job']['plan_id']
+        payload = wait_for_plan(client, plan_id)
+
+    assert payload['job']['state'] == 'completed'
+    assert payload['feeds'] == [
+        {
+            'actor_id': 'actor',
+            'state': 'ready',
+            'attempts': 2,
+            'updated_at': payload['feeds'][0]['updated_at'],
+            'error_code': None,
+            'freshrss_add_url': (
+                'https://rss.s117.me/i/?c=feed&a=add&url_rss='
+                'http%3A%2F%2Frsshub.rss.svc.cluster.local%2Fjavbus%2Fstar%2Factor'
+            ),
+        }
+    ]
 
 
 def test_mutations_require_configured_bearer_token(tmp_path: Path) -> None:

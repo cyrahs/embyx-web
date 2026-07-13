@@ -41,6 +41,22 @@ class JobProgressUnit(StrEnum):
     ITEMS = 'items'
 
 
+class JobFeedState(StrEnum):
+    QUEUED = 'queued'
+    WARMING = 'warming'
+    READY = 'ready'
+    FAILED = 'failed'
+
+
+class JobFeedErrorCode(StrEnum):
+    TIMEOUT = 'rsshub_timeout'
+    NETWORK = 'rsshub_network_error'
+    HTTP = 'rsshub_http_error'
+    INVALID_FEED = 'rsshub_invalid_feed'
+    NOT_READY = 'rsshub_not_ready'
+    CANCELLED = 'rsshub_cancelled'
+
+
 class MoveJournalState(StrEnum):
     PREPARED = 'prepared'
     LINKED = 'linked'
@@ -165,6 +181,31 @@ class JobRecord:
 
 
 @dataclass(frozen=True)
+class JobFeedRecord:
+    job_id: str
+    actor_id: str
+    state: JobFeedState
+    attempts: int
+    updated_at: datetime
+    error_code: JobFeedErrorCode | None = None
+    freshrss_add_url: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.job_id or not self.actor_id:
+            msg = 'job feed identifiers must not be empty'
+            raise ValueError(msg)
+        if self.attempts < 0:
+            msg = 'job feed attempts must not be negative'
+            raise ValueError(msg)
+        if self.state is JobFeedState.FAILED and not self.error_code:
+            msg = 'failed job feeds require an error code'
+            raise ValueError(msg)
+        if self.state is not JobFeedState.FAILED and self.error_code is not None:
+            msg = 'only failed job feeds may have an error code'
+            raise ValueError(msg)
+
+
+@dataclass(frozen=True)
 class MoveJournalRecord:
     plan_id: str
     candidate_id: str
@@ -197,7 +238,13 @@ class FillActorRepository(Protocol):
 
     async def save_job(self, record: JobRecord) -> None: ...
 
-    async def enqueue_job(self, record: JobRecord, *, max_active: int) -> bool: ...
+    async def enqueue_job(
+        self,
+        record: JobRecord,
+        *,
+        max_active: int,
+        feeds: Sequence[JobFeedRecord] = (),
+    ) -> bool: ...
 
     async def claim_next_job(
         self,
@@ -242,6 +289,20 @@ class FillActorRepository(Protocol):
 
     async def list_jobs(self, states: Sequence[JobState] | None = None) -> tuple[JobRecord, ...]: ...
 
+    async def list_job_feeds(self, job_id: str) -> tuple[JobFeedRecord, ...]: ...
+
+    async def update_owned_job_feed(  # noqa: PLR0913
+        self,
+        *,
+        job_id: str,
+        actor_id: str,
+        owner_id: str,
+        state: JobFeedState,
+        attempts: int,
+        error_code: JobFeedErrorCode | None,
+        now: datetime,
+    ) -> bool: ...
+
     async def save_move_journal(self, record: MoveJournalRecord) -> None: ...
 
     async def get_move_journal(self, plan_id: str, candidate_id: str) -> MoveJournalRecord | None: ...
@@ -256,6 +317,7 @@ class MemoryFillActorRepository:
         self._plans: dict[str, PlanRecord] = {}
         self._move_results: dict[tuple[str, str], MoveResult] = {}
         self._jobs: dict[str, JobRecord] = {}
+        self._job_feeds: dict[tuple[str, str], JobFeedRecord] = {}
         self._move_journal: dict[tuple[str, str], MoveJournalRecord] = {}
         self._lock = asyncio.Lock()
 
@@ -330,12 +392,23 @@ class MemoryFillActorRepository:
         async with self._lock:
             self._jobs[record.job_id] = record
 
-    async def enqueue_job(self, record: JobRecord, *, max_active: int) -> bool:
+    async def enqueue_job(
+        self,
+        record: JobRecord,
+        *,
+        max_active: int,
+        feeds: Sequence[JobFeedRecord] = (),
+    ) -> bool:
         async with self._lock:
             active = sum(job.state in {JobState.QUEUED, JobState.RUNNING} for job in self._jobs.values())
             if active >= max_active or record.job_id in self._jobs:
                 return False
+            feed_keys = [(feed.job_id, feed.actor_id) for feed in feeds]
+            if any(feed.job_id != record.job_id for feed in feeds) or len(feed_keys) != len(set(feed_keys)):
+                msg = 'job feeds must be unique and belong to the enqueued job'
+                raise ValueError(msg)
             self._jobs[record.job_id] = record
+            self._job_feeds.update({(feed.job_id, feed.actor_id): feed for feed in feeds})
             return True
 
     async def claim_next_job(
@@ -469,6 +542,17 @@ class MemoryFillActorRepository:
                     lease_expires_at=None,
                     progress=_terminal_progress(job.progress, now),
                 )
+                for key, feed in tuple(self._job_feeds.items()):
+                    if key[0] == job.job_id and feed.state in {JobFeedState.QUEUED, JobFeedState.WARMING}:
+                        self._job_feeds[key] = JobFeedRecord(
+                            job_id=feed.job_id,
+                            actor_id=feed.actor_id,
+                            state=JobFeedState.FAILED,
+                            attempts=feed.attempts,
+                            updated_at=now,
+                            error_code=JobFeedErrorCode.CANCELLED,
+                            freshrss_add_url=feed.freshrss_add_url,
+                        )
             return len(expired)
 
     async def get_job(self, job_id: str) -> JobRecord | None:
@@ -482,6 +566,54 @@ class MemoryFillActorRepository:
                 record for record in self._jobs.values() if selected_states is None or record.state in selected_states
             ]
             return tuple(sorted(records, key=lambda record: (record.created_at, record.job_id)))
+
+    async def list_job_feeds(self, job_id: str) -> tuple[JobFeedRecord, ...]:
+        async with self._lock:
+            return tuple(self._job_feeds[key] for key in sorted(self._job_feeds) if key[0] == job_id)
+
+    async def update_owned_job_feed(  # noqa: PLR0913
+        self,
+        *,
+        job_id: str,
+        actor_id: str,
+        owner_id: str,
+        state: JobFeedState,
+        attempts: int,
+        error_code: JobFeedErrorCode | None,
+        now: datetime,
+    ) -> bool:
+        replacement = JobFeedRecord(
+            job_id=job_id,
+            actor_id=actor_id,
+            state=state,
+            attempts=attempts,
+            updated_at=now,
+            error_code=error_code,
+        )
+        async with self._lock:
+            job = self._jobs.get(job_id)
+            current = self._job_feeds.get((job_id, actor_id))
+            if (
+                job is None
+                or current is None
+                or job.owner_id != owner_id
+                or job.state is not JobState.RUNNING
+                or job.lease_expires_at is None
+                or normalize_datetime(job.lease_expires_at) <= normalize_datetime(now)
+                or current.state in {JobFeedState.READY, JobFeedState.FAILED}
+                or attempts < current.attempts
+            ):
+                return False
+            self._job_feeds[(job_id, actor_id)] = JobFeedRecord(
+                job_id=replacement.job_id,
+                actor_id=replacement.actor_id,
+                state=replacement.state,
+                attempts=replacement.attempts,
+                updated_at=replacement.updated_at,
+                error_code=replacement.error_code,
+                freshrss_add_url=current.freshrss_add_url,
+            )
+            return True
 
     async def save_move_journal(self, record: MoveJournalRecord) -> None:
         async with self._lock:

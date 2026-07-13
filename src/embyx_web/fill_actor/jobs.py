@@ -6,9 +6,11 @@ from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 
 from embyx_web.fill_actor.errors import FillActorError, JobQueueFullError
+from embyx_web.fill_actor.feeds import RSSHubFeedWarmer
 from embyx_web.fill_actor.models import FillActorPlan, VideoState
 from embyx_web.fill_actor.persistence import (
     FillActorRepository,
+    JobFeedRecord,
     JobOperation,
     JobProgress,
     JobProgressEvent,
@@ -179,6 +181,7 @@ class FillActorJobManager:
         lease_duration: timedelta = timedelta(seconds=30),
         poll_interval: float = 0.25,
         progress_flush_interval: float = 0.75,
+        feed_warmer: RSSHubFeedWarmer | None = None,
     ) -> None:
         if max_concurrent_jobs < 1 or max_active_jobs < max_concurrent_jobs:
             msg = 'job capacity must be positive and at least the worker count'
@@ -196,6 +199,7 @@ class FillActorJobManager:
         self._lease_duration = lease_duration
         self._poll_interval = poll_interval
         self._progress_flush_interval = progress_flush_interval
+        self._feed_warmer = feed_warmer
         self._wake = asyncio.Event()
         self._lifecycle_lock = asyncio.Lock()
         self._workers: tuple[asyncio.Task[None], ...] = ()
@@ -236,7 +240,10 @@ class FillActorJobManager:
                 updated_at=now,
             ),
         )
-        if not await self._repository.enqueue_job(job, max_active=self._max_active_jobs):
+        feeds: tuple[JobFeedRecord, ...] = ()
+        if self._feed_warmer is not None:
+            feeds = self._feed_warmer.initial_records(job_id=job.job_id, actor_ids=normalized, now=now)
+        if not await self._repository.enqueue_job(job, max_active=self._max_active_jobs, feeds=feeds):
             raise JobQueueFullError(str(self._max_active_jobs))
         self._wake.set()
         return job
@@ -251,6 +258,9 @@ class FillActorJobManager:
         record = await self._repository.get_plan(plan_id)
         return await self._service.get_plan(plan_id) if record is not None else None
 
+    async def get_feeds(self, plan_id: str) -> tuple[JobFeedRecord, ...]:
+        return await self._repository.list_job_feeds(plan_id)
+
     async def recover_interrupted_jobs(self) -> int:
         return await self._repository.fail_expired_jobs(now=self._now(), error_code='job_interrupted')
 
@@ -263,6 +273,8 @@ class FillActorJobManager:
                 task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+            if self._feed_warmer is not None:
+                await self._feed_warmer.aclose()
 
     async def _worker_loop(self) -> None:
         while True:
@@ -297,18 +309,24 @@ class FillActorJobManager:
             flush_interval=self._progress_flush_interval,
         )
         heartbeat = asyncio.create_task(self._heartbeat(job, reporter))
+        feed_task: asyncio.Task[None] | None = None
         try:
+            feed_task = await self._start_feed_warmup(job)
             plan = await self._service.create_plan(job.actor_ids, plan_id=job.plan_id, progress=reporter)
+            await self._wait_feed_warmup(feed_task, job)
         except asyncio.CancelledError:
             await self._stop_heartbeat(heartbeat)
+            await asyncio.shield(self._abort_feed_warmup(feed_task, job))
             await asyncio.shield(self._finish_terminal(reporter, JobState.FAILED, error_code='job_interrupted'))
             raise
         except FillActorError as exc:
             await self._stop_heartbeat(heartbeat)
+            await self._abort_feed_warmup(feed_task, job)
             await self._finish_terminal(reporter, JobState.FAILED, error_code=exc.code)
             return
         except Exception:  # noqa: BLE001
             await self._stop_heartbeat(heartbeat)
+            await self._abort_feed_warmup(feed_task, job)
             await self._finish_terminal(reporter, JobState.FAILED, error_code='plan_creation_failed')
             return
 
@@ -347,6 +365,31 @@ class FillActorJobManager:
                     await reporter.mark_unowned()
                     return
                 break
+
+    async def _start_feed_warmup(self, job: JobRecord) -> asyncio.Task[None] | None:
+        if self._feed_warmer is None:
+            return None
+        try:
+            return await self._feed_warmer.start_job(job, owner_id=self._owner_id)
+        except Exception:
+            LOGGER.exception('RSSHub feed warm-up could not start')
+            await self._feed_warmer.abort_job(None, job, owner_id=self._owner_id)
+            return None
+
+    async def _wait_feed_warmup(self, task: asyncio.Task[None] | None, job: JobRecord) -> None:
+        if task is None:
+            return
+        try:
+            await task
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception('RSSHub feed warm-up failed unexpectedly')
+            await self._abort_feed_warmup(None, job)
+
+    async def _abort_feed_warmup(self, task: asyncio.Task[None] | None, job: JobRecord) -> None:
+        if self._feed_warmer is not None:
+            await self._feed_warmer.abort_job(task, job, owner_id=self._owner_id)
 
     async def _reaper_loop(self) -> None:
         interval = max(self._lease_duration.total_seconds() / 3, self._poll_interval)
