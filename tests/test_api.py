@@ -8,10 +8,12 @@ import httpx2
 import pytest
 from fastapi.testclient import TestClient
 
-from embyx_web.api import JobProgressView, create_app
+from embyx_web.api import ActorFeedView, JobProgressView, create_app
 from embyx_web.fill_actor.feeds import RSSHubFeedWarmer
 from embyx_web.fill_actor.jobs import FillActorJobManager
 from embyx_web.fill_actor.persistence import (
+    JobFeedRecord,
+    JobFeedState,
     JobProgress,
     JobProgressUnit,
     JobStage,
@@ -54,6 +56,8 @@ def make_client(
     max_request_bytes: int = 65_536,
     actor_catalog=None,
     feed_warmer_factory=None,
+    freshrss_url: str | None = None,
+    freshrss_rsshub_url: str | None = None,
 ) -> tuple[TestClient, FillActorPaths, MemoryFillActorRepository]:
     paths = FillActorPaths.from_iterable(
         actor_brand_path=tmp_path / 'actor',
@@ -78,6 +82,8 @@ def make_client(
         jobs=jobs,
         api_token=api_token,
         max_request_bytes=max_request_bytes,
+        freshrss_url=freshrss_url,
+        freshrss_rsshub_url=freshrss_rsshub_url,
     )
     return TestClient(app), paths, repository
 
@@ -140,13 +146,19 @@ def test_plan_envelope_exposes_persisted_feed_status_and_freshrss_action(tmp_pat
     def feed_warmer_factory(repository):
         return RSSHubFeedWarmer(
             repository=repository,
-            rsshub_url='http://rsshub.rss.svc.cluster.local',
-            freshrss_url='https://rss.s117.me',
+            rsshub_url='http://rsshub.internal.test',
+            freshrss_url='https://freshrss.example.test',
+            freshrss_rsshub_url='https://rsshub.example.test',
             client=http_client,
             poll_interval=0.001,
         )
 
-    client, _, _ = make_client(tmp_path, feed_warmer_factory=feed_warmer_factory)
+    client, _, _ = make_client(
+        tmp_path,
+        feed_warmer_factory=feed_warmer_factory,
+        freshrss_url='https://freshrss.example.test',
+        freshrss_rsshub_url='https://rsshub.example.test',
+    )
     with client:
         created = client.post('/api/fill-actor/plans', json={'actor_ids': ['actor']})
         assert created.status_code == 202
@@ -163,11 +175,52 @@ def test_plan_envelope_exposes_persisted_feed_status_and_freshrss_action(tmp_pat
             'updated_at': payload['feeds'][0]['updated_at'],
             'error_code': None,
             'freshrss_add_url': (
-                'https://rss.s117.me/i/?c=feed&a=add&url_rss='
-                'http%3A%2F%2Frsshub.rss.svc.cluster.local%2Fjavbus%2Fstar%2Factor'
+                'https://freshrss.example.test/i/?c=feed&a=add&url_rss='
+                'https%3A%2F%2Frsshub.example.test%2Fjavbus%2Fstar%2Factor'
             ),
+            'freshrss_url': 'https://freshrss.example.test',
         }
     ]
+
+
+def test_feed_view_rebuilds_legacy_add_url_from_current_configuration() -> None:
+    updated_at = datetime(2026, 7, 13, 12, 0, tzinfo=UTC)
+    record = JobFeedRecord(
+        job_id='legacy-job',
+        actor_id='actor',
+        state=JobFeedState.READY,
+        attempts=2,
+        updated_at=updated_at,
+        freshrss_add_url='https://legacy.example.test/i/?c=feed&a=add',
+    )
+
+    payload = ActorFeedView.from_record(
+        record,
+        freshrss_url='https://current-freshrss.example.test',
+        freshrss_rsshub_url='https://current-rsshub.example.test',
+    ).model_dump()
+
+    assert payload['freshrss_add_url'] == (
+        'https://current-freshrss.example.test/i/?c=feed&a=add&url_rss='
+        'https%3A%2F%2Fcurrent-rsshub.example.test%2Fjavbus%2Fstar%2Factor'
+    )
+    assert payload['freshrss_url'] == 'https://current-freshrss.example.test'
+
+
+def test_feed_view_hides_legacy_freshrss_actions_when_current_configuration_is_disabled() -> None:
+    record = JobFeedRecord(
+        job_id='legacy-job',
+        actor_id='actor',
+        state=JobFeedState.READY,
+        attempts=2,
+        updated_at=datetime(2026, 7, 13, 12, 0, tzinfo=UTC),
+        freshrss_add_url='https://legacy.example.test/i/?c=feed&a=add',
+    )
+
+    payload = ActorFeedView.from_record(record).model_dump()
+
+    assert payload['freshrss_add_url'] is None
+    assert payload['freshrss_url'] is None
 
 
 def test_mutations_require_configured_bearer_token(tmp_path: Path) -> None:

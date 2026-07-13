@@ -51,6 +51,21 @@ class _RootElementTarget:
         return None
 
 
+def build_freshrss_add_url(
+    actor_id: str,
+    *,
+    freshrss_url: str | None,
+    freshrss_rsshub_url: str | None,
+) -> str | None:
+    if freshrss_url is None or freshrss_rsshub_url is None:
+        return None
+    parsed = urlsplit(freshrss_url.rstrip('/'))
+    path = f'{parsed.path.rstrip("/")}/i/'
+    feed_url = f'{freshrss_rsshub_url.rstrip("/")}/javbus/star/{quote(actor_id, safe="")}'
+    query = urlencode({'c': 'feed', 'a': 'add', 'url_rss': feed_url})
+    return urlunsplit((parsed.scheme, parsed.netloc, path, query, ''))
+
+
 class RSSHubFeedWarmer:
     def __init__(  # noqa: PLR0913
         self,
@@ -58,6 +73,7 @@ class RSSHubFeedWarmer:
         repository: FillActorRepository,
         rsshub_url: str,
         freshrss_url: str | None = None,
+        freshrss_rsshub_url: str | None = None,
         client: httpx2.AsyncClient | None = None,
         request_timeout: float = 70.0,
         poll_interval: float = 1.0,
@@ -76,6 +92,7 @@ class RSSHubFeedWarmer:
         self._repository = repository
         self._rsshub_url = rsshub_url.rstrip('/')
         self._freshrss_url = freshrss_url.rstrip('/') if freshrss_url else None
+        self._freshrss_rsshub_url = freshrss_rsshub_url.rstrip('/') if freshrss_rsshub_url else None
         self._client = client or httpx2.AsyncClient(
             timeout=request_timeout,
             follow_redirects=False,
@@ -359,18 +376,11 @@ class RSSHubFeedWarmer:
         return f'{self._rsshub_url}/javbus/star/{quote(actor_id, safe="")}'
 
     def _freshrss_add_url(self, actor_id: str) -> str | None:
-        if self._freshrss_url is None:
-            return None
-        parsed = urlsplit(self._freshrss_url)
-        path = f'{parsed.path.rstrip("/")}/i/'
-        query = urlencode(
-            {
-                'c': 'feed',
-                'a': 'add',
-                'url_rss': self._feed_url(actor_id),
-            }
+        return build_freshrss_add_url(
+            actor_id,
+            freshrss_url=self._freshrss_url,
+            freshrss_rsshub_url=self._freshrss_rsshub_url,
         )
-        return urlunsplit((parsed.scheme, parsed.netloc, path, query, ''))
 
     def _now(self) -> datetime:
         now = self._clock()

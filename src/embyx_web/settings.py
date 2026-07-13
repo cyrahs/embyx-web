@@ -12,8 +12,13 @@ def _optional_path(value: str | None) -> Path | None:
 def _optional_http_base_url(name: str, value: str | None) -> str | None:
     if not value:
         return None
-    parsed = urlsplit(value)
-    if parsed.scheme not in {'http', 'https'} or not parsed.hostname:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        msg = f'{name} must be an absolute HTTP(S) URL'
+        raise ValueError(msg) from exc
+    if parsed.scheme not in {'http', 'https'} or not parsed.hostname or port == 0:
         msg = f'{name} must be an absolute HTTP(S) URL'
         raise ValueError(msg)
     if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
@@ -72,8 +77,9 @@ class Settings:
     magnet_concurrency: int = 8
     root_sentinel: str = '.embyx-root'
     move_in_by_brand: bool = False
-    rsshub_url: str | None = 'http://rsshub.rss.svc.cluster.local'
+    rsshub_url: str | None = None
     freshrss_url: str | None = None
+    freshrss_rsshub_url: str | None = None
 
     @classmethod
     def from_env(cls) -> 'Settings':
@@ -107,11 +113,15 @@ class Settings:
             move_in_by_brand=_boolean('EMBYX_WEB_MOVE_IN_BY_BRAND'),
             rsshub_url=_optional_http_base_url(
                 'EMBYX_WEB_RSSHUB_URL',
-                os.environ.get('EMBYX_WEB_RSSHUB_URL', 'http://rsshub.rss.svc.cluster.local'),
+                os.environ.get('EMBYX_WEB_RSSHUB_URL'),
             ),
             freshrss_url=_optional_http_base_url(
                 'EMBYX_WEB_FRESHRSS_URL',
                 os.environ.get('EMBYX_WEB_FRESHRSS_URL'),
+            ),
+            freshrss_rsshub_url=_optional_http_base_url(
+                'EMBYX_WEB_FRESHRSS_RSSHUB_URL',
+                os.environ.get('EMBYX_WEB_FRESHRSS_RSSHUB_URL'),
             ),
         )
         settings.validate_exposure()

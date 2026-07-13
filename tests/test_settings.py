@@ -16,8 +16,9 @@ def test_settings_use_explicit_non_secret_runtime_paths(monkeypatch: pytest.Monk
     monkeypatch.setenv('EMBYX_WEB_MOVE_IN_ROOT', str(tmp_path / 'move-in'))
     monkeypatch.setenv('EMBYX_WEB_RUNTIME_ROOT', str(tmp_path / 'runtime'))
     monkeypatch.setenv('EMBYX_WEB_MOVE_IN_BY_BRAND', 'true')
-    monkeypatch.setenv('EMBYX_WEB_RSSHUB_URL', 'http://rsshub.rss.svc.cluster.local/')
-    monkeypatch.setenv('EMBYX_WEB_FRESHRSS_URL', 'https://rss.s117.me/')
+    monkeypatch.setenv('EMBYX_WEB_RSSHUB_URL', 'http://rsshub.internal.test/')
+    monkeypatch.setenv('EMBYX_WEB_FRESHRSS_URL', 'https://freshrss.example.test/')
+    monkeypatch.setenv('EMBYX_WEB_FRESHRSS_RSSHUB_URL', 'https://rsshub.example.test/')
 
     settings = Settings.from_env()
 
@@ -27,16 +28,28 @@ def test_settings_use_explicit_non_secret_runtime_paths(monkeypatch: pytest.Monk
     assert settings.move_in_path == tmp_path / 'move-in'
     assert settings.embyx_runtime_path == tmp_path / 'runtime'
     assert settings.move_in_by_brand is True
-    assert settings.rsshub_url == 'http://rsshub.rss.svc.cluster.local'
-    assert settings.freshrss_url == 'https://rss.s117.me'
+    assert settings.rsshub_url == 'http://rsshub.internal.test'
+    assert settings.freshrss_url == 'https://freshrss.example.test'
+    assert settings.freshrss_rsshub_url == 'https://rsshub.example.test'
 
 
-def test_rsshub_defaults_to_cluster_service_and_empty_value_disables_it(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv('EMBYX_WEB_RSSHUB_URL', raising=False)
-    assert Settings.from_env().rsshub_url == 'http://rsshub.rss.svc.cluster.local'
+def test_feed_integration_urls_default_to_disabled_and_empty_values_disable_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    names = ('EMBYX_WEB_RSSHUB_URL', 'EMBYX_WEB_FRESHRSS_URL', 'EMBYX_WEB_FRESHRSS_RSSHUB_URL')
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings.from_env()
+    assert settings.rsshub_url is None
+    assert settings.freshrss_url is None
+    assert settings.freshrss_rsshub_url is None
 
-    monkeypatch.setenv('EMBYX_WEB_RSSHUB_URL', '')
-    assert Settings.from_env().rsshub_url is None
+    for name in names:
+        monkeypatch.setenv(name, '')
+    settings = Settings.from_env()
+    assert settings.rsshub_url is None
+    assert settings.freshrss_url is None
+    assert settings.freshrss_rsshub_url is None
 
 
 @pytest.mark.parametrize(
@@ -45,6 +58,10 @@ def test_rsshub_defaults_to_cluster_service_and_empty_value_disables_it(monkeypa
         ('EMBYX_WEB_RSSHUB_URL', 'ftp://rsshub.example'),
         ('EMBYX_WEB_RSSHUB_URL', 'http://user:password@rsshub.example'),
         ('EMBYX_WEB_FRESHRSS_URL', 'https://rss.example/?token=secret'),
+        ('EMBYX_WEB_FRESHRSS_RSSHUB_URL', 'file:///var/lib/rsshub'),
+        ('EMBYX_WEB_RSSHUB_URL', 'https://rsshub.example.test:not-a-port'),
+        ('EMBYX_WEB_FRESHRSS_URL', 'https://freshrss.example.test:70000'),
+        ('EMBYX_WEB_FRESHRSS_RSSHUB_URL', 'https://rsshub.example.test:0'),
     ],
 )
 def test_feed_integration_urls_reject_unsafe_bases(

@@ -91,6 +91,7 @@ export interface ActorFeedStatus {
   updated_at: string
   error_code: string | null
   freshrss_add_url: string | null
+  freshrss_url: string | null
 }
 
 export interface PlanEnvelope {

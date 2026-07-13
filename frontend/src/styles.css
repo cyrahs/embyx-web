@@ -140,6 +140,7 @@ textarea:disabled { opacity: .6; cursor: wait; }
 .feed-failed .feed-state { color: var(--red); }
 .feed-detail { margin: 0; color: #777d82; font-size: 10px; line-height: 1.5; }
 .feed-failed .feed-detail { color: #c27a76; overflow-wrap: anywhere; }
+.feed-actions { grid-column: 3 / -1; justify-self: end; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 .freshrss-button { min-height: 34px; padding: 0 11px; white-space: nowrap; font-size: 9px; }
 .freshrss-button svg { width: 14px; height: 14px; }
 
@@ -230,7 +231,7 @@ textarea:disabled { opacity: .6; cursor: wait; }
   .magnet-copy-error { margin-top: -6px; }
   .feed-row { grid-template-columns: 1fr auto; gap: 8px 12px; }
   .feed-detail { grid-column: 1 / -1; }
-  .freshrss-button { grid-column: 1 / -1; justify-self: start; }
+  .feed-actions { grid-column: 1 / -1; justify-self: start; justify-content: flex-start; }
   .video-row { grid-template-columns: 1fr; gap: 11px; }
   .warning-pill { white-space: normal; }
   .action-dock { bottom: 9px; }

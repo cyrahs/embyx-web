@@ -99,17 +99,27 @@ function looksLikeJob(value: unknown): value is PlanJob {
   )
 }
 
-function looksLikeActorFeedStatus(value: unknown): value is ActorFeedStatus {
-  if (!isRecord(value)) return false
-  return (
+function normalizeActorFeedStatus(value: unknown): ActorFeedStatus | null {
+  if (!isRecord(value)) return null
+  if (!(
     typeof value.actor_id === 'string' &&
     ['queued', 'warming', 'ready', 'failed'].includes(String(value.state)) &&
     typeof value.attempts === 'number' &&
     Number.isFinite(value.attempts) &&
     typeof value.updated_at === 'string' &&
     (value.error_code === null || typeof value.error_code === 'string') &&
-    (value.freshrss_add_url === null || typeof value.freshrss_add_url === 'string')
-  )
+    (value.freshrss_add_url === null || typeof value.freshrss_add_url === 'string') &&
+    (value.freshrss_url === undefined || value.freshrss_url === null || typeof value.freshrss_url === 'string')
+  )) return null
+  return {
+    actor_id: value.actor_id,
+    state: value.state as ActorFeedStatus['state'],
+    attempts: value.attempts,
+    updated_at: value.updated_at,
+    error_code: value.error_code,
+    freshrss_add_url: value.freshrss_add_url,
+    freshrss_url: value.freshrss_url ?? null,
+  }
 }
 
 export function normalizePlanEnvelope(value: unknown): PlanEnvelope {
@@ -118,7 +128,12 @@ export function normalizePlanEnvelope(value: unknown): PlanEnvelope {
 
   const plan = looksLikePlan(value.plan) ? value.plan : null
   const job = looksLikeJob(value.job) ? value.job : looksLikeJob(value) ? value : null
-  const feeds = Array.isArray(value.feeds) ? value.feeds.filter(looksLikeActorFeedStatus) : []
+  const feeds = Array.isArray(value.feeds)
+    ? value.feeds.flatMap((feed) => {
+        const normalized = normalizeActorFeedStatus(feed)
+        return normalized ? [normalized] : []
+      })
+    : []
   const planId =
     plan?.plan_id ??
     (typeof value.plan_id === 'string' ? value.plan_id : null) ??

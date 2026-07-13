@@ -27,6 +27,7 @@ from embyx_web.fill_actor.errors import (
     UnknownCandidateError,
     UnknownPlanError,
 )
+from embyx_web.fill_actor.feeds import build_freshrss_add_url
 from embyx_web.fill_actor.jobs import FillActorJobManager
 from embyx_web.fill_actor.models import ApplyResult, FillActorPlan
 from embyx_web.fill_actor.persistence import (
@@ -140,16 +141,28 @@ class ActorFeedView(BaseModel):
     updated_at: datetime
     error_code: str | None
     freshrss_add_url: str | None
+    freshrss_url: str | None
 
     @classmethod
-    def from_record(cls, record: JobFeedRecord) -> 'ActorFeedView':
+    def from_record(
+        cls,
+        record: JobFeedRecord,
+        *,
+        freshrss_url: str | None = None,
+        freshrss_rsshub_url: str | None = None,
+    ) -> 'ActorFeedView':
         return cls(
             actor_id=record.actor_id,
             state=record.state.value,
             attempts=record.attempts,
             updated_at=record.updated_at,
             error_code=record.error_code.value if record.error_code is not None else None,
-            freshrss_add_url=record.freshrss_add_url,
+            freshrss_add_url=build_freshrss_add_url(
+                record.actor_id,
+                freshrss_url=freshrss_url,
+                freshrss_rsshub_url=freshrss_rsshub_url,
+            ),
+            freshrss_url=freshrss_url,
         )
 
 
@@ -212,6 +225,8 @@ def create_app(  # noqa: C901, PLR0913, PLR0915
     max_request_bytes: int = 65_536,
     runtime_close: Callable[[], Awaitable[None]] | None = None,
     frontend_dist: Path | None = None,
+    freshrss_url: str | None = None,
+    freshrss_rsshub_url: str | None = None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -303,7 +318,14 @@ def create_app(  # noqa: C901, PLR0913, PLR0915
         return PlanEnvelope(
             job=JobView.from_record(job),
             plan=None,
-            feeds=tuple(ActorFeedView.from_record(feed) for feed in feeds),
+            feeds=tuple(
+                ActorFeedView.from_record(
+                    feed,
+                    freshrss_url=freshrss_url,
+                    freshrss_rsshub_url=freshrss_rsshub_url,
+                )
+                for feed in feeds
+            ),
         )
 
     @app.get('/api/fill-actor/plans/{plan_id}')
@@ -320,7 +342,14 @@ def create_app(  # noqa: C901, PLR0913, PLR0915
         return PlanEnvelope(
             job=JobView.from_record(job),
             plan=plan,
-            feeds=tuple(ActorFeedView.from_record(feed) for feed in feeds),
+            feeds=tuple(
+                ActorFeedView.from_record(
+                    feed,
+                    freshrss_url=freshrss_url,
+                    freshrss_rsshub_url=freshrss_rsshub_url,
+                )
+                for feed in feeds
+            ),
         )
 
     @app.post(

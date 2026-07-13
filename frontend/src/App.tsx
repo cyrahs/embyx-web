@@ -705,7 +705,8 @@ function ActorFeeds({ feeds }: { feeds: ActorFeedStatus[] }) {
       </div>
       <ul className="feed-list">
         {feeds.map((feed) => {
-          const freshrssUrl = feed.state === 'ready' ? safeFreshRssUrl(feed.freshrss_add_url) : null
+          const freshrssAddUrl = feed.state === 'ready' ? safeFreshRssUrl(feed.freshrss_add_url) : null
+          const freshrssUrl = feed.state === 'ready' ? safeFreshRssUrl(feed.freshrss_url) : null
           return (
             <li className={`feed-row feed-${feed.state}`} key={feed.actor_id}>
               <div className="feed-actor">
@@ -719,10 +720,19 @@ function ActorFeeds({ feeds }: { feeds: ActorFeedStatus[] }) {
               {feed.state === 'failed' && (
                 <p className="feed-detail">{feed.error_code ? `错误：${feed.error_code}` : '缓存预热未能完成。'}</p>
               )}
-              {freshrssUrl && (
-                <a className="button secondary freshrss-button" href={freshrssUrl} target="_blank" rel="noopener noreferrer">
-                  <ExternalIcon />一键添加到 FreshRSS
-                </a>
+              {(freshrssAddUrl || freshrssUrl) && (
+                <div className="feed-actions">
+                  {freshrssAddUrl && (
+                    <a className="button secondary freshrss-button" href={freshrssAddUrl} target="_blank" rel="noopener noreferrer">
+                      <ExternalIcon />一键添加到 FreshRSS
+                    </a>
+                  )}
+                  {freshrssUrl && (
+                    <a className="button secondary freshrss-button" href={freshrssUrl} target="_blank" rel="noopener noreferrer">
+                      <ExternalIcon />打开 FreshRSS
+                    </a>
+                  )}
+                </div>
               )}
             </li>
           )
