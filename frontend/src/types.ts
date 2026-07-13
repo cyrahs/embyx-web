@@ -1,0 +1,82 @@
+export type VideoState =
+  | 'exists'
+  | 'additional_found'
+  | 'magnet_found'
+  | 'missing'
+  | 'invalid_video_id'
+  | 'scan_failed'
+
+export type MoveState = 'moved' | 'stale' | 'conflict' | 'invalid_path' | 'failed'
+export type ApplyState = 'succeeded' | 'partial_failed' | 'failed'
+export type JobState = 'queued' | 'running' | 'completed' | 'partial_failed' | 'failed'
+
+export interface ActorPlan {
+  actor_id: string
+  scraped_count: number
+  video_ids: string[]
+  error_code: string | null
+}
+export interface MoveCandidate {
+  candidate_id: string
+  video_id: string
+  file_name: string
+  source_label: string
+  destination_conflict: boolean
+}
+
+export interface VideoPlan {
+  video_id: string
+  actor_ids: string[]
+  state: VideoState
+  existing_files: string[]
+  move_candidates: MoveCandidate[]
+  magnet: string | null
+  warnings: string[]
+}
+
+export interface FillActorPlan {
+  plan_id: string
+  revision: string
+  created_at: string
+  expires_at: string
+  actors: ActorPlan[]
+  videos: VideoPlan[]
+}
+
+export interface MoveResult {
+  candidate_id: string
+  video_id: string
+  file_name: string
+  state: MoveState
+  error_code: string | null
+}
+
+export interface ApplyResult {
+  plan_id: string
+  revision: string
+  state: ApplyState
+  results: MoveResult[]
+}
+
+export interface JobProgress {
+  completed?: number
+  total?: number
+  current?: string
+  percent?: number
+}
+
+export interface PlanJob {
+  id?: string
+  job_id?: string
+  plan_id?: string
+  state?: JobState
+  status?: JobState
+  error_code?: string | null
+  progress?: JobProgress | null
+}
+
+export interface PlanEnvelope {
+  plan: FillActorPlan | null
+  job: PlanJob | null
+  planId: string | null
+}

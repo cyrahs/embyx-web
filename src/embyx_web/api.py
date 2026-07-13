@@ -1,0 +1,268 @@
+import asyncio
+import logging
+import secrets
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from contextlib import asynccontextmanager, suppress
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Annotated
+
+from fastapi import Depends, FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, ConfigDict, Field
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+from embyx_web.fill_actor.errors import (
+    ExpiredPlanError,
+    FillActorError,
+    InvalidActorIdError,
+    JobQueueFullError,
+    RevisionMismatchError,
+    TooManyActorsError,
+    TooManyVideosError,
+    UnknownCandidateError,
+    UnknownPlanError,
+)
+from embyx_web.fill_actor.jobs import FillActorJobManager
+from embyx_web.fill_actor.models import ApplyResult, FillActorPlan
+from embyx_web.fill_actor.persistence import FillActorRepository, JobRecord, JobState
+from embyx_web.fill_actor.service import FillActorService
+
+HTTP_UNAUTHORIZED = 401
+LOGGER = logging.getLogger(__name__)
+
+
+class CreatePlanRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    actor_ids: list[str] = Field(min_length=1)
+
+
+class ApplyPlanRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    revision: str = Field(min_length=1, max_length=256)
+    candidate_ids: list[str] = Field(default_factory=list, max_length=5_000)
+
+
+class JobView(BaseModel):
+    job_id: str
+    plan_id: str | None
+    operation: str
+    state: str
+    created_at: datetime
+    updated_at: datetime
+    error_code: str | None
+
+    @classmethod
+    def from_record(cls, record: JobRecord) -> 'JobView':
+        return cls(
+            job_id=record.job_id,
+            plan_id=record.plan_id,
+            operation=record.operation.value,
+            state=record.state.value,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+            error_code=record.error_code,
+        )
+
+
+class PlanJobResponse(BaseModel):
+    job: JobView
+    plan: FillActorPlan | None
+
+
+class ApiError(Exception):
+    def __init__(self, status_code: int, code: str) -> None:
+        self.status_code = status_code
+        self.code = code
+        super().__init__(code)
+
+
+class RequestSizeLimitMiddleware:
+    def __init__(self, app: ASGIApp, *, max_bytes: int) -> None:
+        self._app = app
+        self._max_bytes = max_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope['type'] != 'http' or scope.get('method') not in {'POST', 'PUT', 'PATCH'}:
+            await self._app(scope, receive, send)
+            return
+
+        messages: list[Message] = []
+        received = 0
+        while True:
+            message = await receive()
+            messages.append(message)
+            if message['type'] == 'http.request':
+                received += len(message.get('body', b''))
+                if received > self._max_bytes:
+                    response = JSONResponse({'error': {'code': 'request_too_large'}}, status_code=413)
+                    await response(scope, receive, send)
+                    return
+                if not message.get('more_body', False):
+                    break
+            elif message['type'] == 'http.disconnect':
+                break
+
+        iterator = iter(messages)
+
+        async def replay() -> Message:
+            try:
+                return next(iterator)
+            except StopIteration:
+                return {'type': 'http.request', 'body': b'', 'more_body': False}
+
+        await self._app(scope, replay, send)
+
+
+def create_app(  # noqa: C901, PLR0913, PLR0915
+    *,
+    service: FillActorService,
+    repository: FillActorRepository,
+    jobs: FillActorJobManager,
+    api_token: str | None = None,
+    max_request_bytes: int = 65_536,
+    runtime_close: Callable[[], Awaitable[None]] | None = None,
+    frontend_dist: Path | None = None,
+) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        if not await repository.health_check():
+            msg = 'fill-actor repository is unavailable'
+            raise RuntimeError(msg)
+        if await service.roots_ready():
+            await service.reconcile_moves()
+        await jobs.start()
+
+        async def maintain() -> None:
+            while True:
+                try:
+                    if await service.roots_ready():
+                        await service.reconcile_moves()
+                    await repository.purge_expired_plans(datetime.now(UTC))
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    LOGGER.exception('fill-actor maintenance iteration failed')
+                await asyncio.sleep(5)
+
+        maintenance = asyncio.create_task(maintain(), name='fill-actor-maintenance')
+        try:
+            yield
+        finally:
+            maintenance.cancel()
+            with suppress(asyncio.CancelledError):
+                await maintenance
+            await jobs.aclose()
+            await service.aclose()
+            if runtime_close is not None:
+                await runtime_close()
+
+    app = FastAPI(title='embyx-web', version='0.2.0', lifespan=lifespan)
+    app.add_middleware(RequestSizeLimitMiddleware, max_bytes=max_request_bytes)
+    bearer = HTTPBearer(auto_error=False)
+
+    async def require_mutation_auth(
+        credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
+    ) -> None:
+        if api_token is None:
+            return
+        if (
+            credentials is None
+            or credentials.scheme.casefold() != 'bearer'
+            or not secrets.compare_digest(credentials.credentials, api_token)
+        ):
+            raise ApiError(401, 'unauthorized')
+
+    async def require_ready() -> None:
+        if not await repository.health_check() or not await service.roots_ready():
+            raise ApiError(503, 'not_ready')
+
+    @app.exception_handler(ApiError)
+    async def handle_api_error(_request: Request, exc: ApiError) -> JSONResponse:
+        headers = {'WWW-Authenticate': 'Bearer'} if exc.status_code == HTTP_UNAUTHORIZED else None
+        return JSONResponse({'error': {'code': exc.code}}, status_code=exc.status_code, headers=headers)
+
+    @app.exception_handler(FillActorError)
+    async def handle_fill_actor_error(_request: Request, exc: FillActorError) -> JSONResponse:
+        return JSONResponse(
+            {'error': {'code': exc.code}},
+            status_code=_service_error_status(exc),
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def handle_validation_error(_request: Request, _exc: RequestValidationError) -> JSONResponse:
+        return JSONResponse({'error': {'code': 'invalid_request'}}, status_code=422)
+
+    @app.post(
+        '/api/fill-actor/plans',
+        status_code=202,
+        dependencies=[Depends(require_mutation_auth), Depends(require_ready)],
+    )
+    async def create_plan(request: CreatePlanRequest) -> PlanJobResponse:
+        job = await jobs.start_plan(request.actor_ids)
+        return PlanJobResponse(job=JobView.from_record(job), plan=None)
+
+    @app.get('/api/fill-actor/plans/{plan_id}')
+    async def get_plan(plan_id: str) -> PlanJobResponse:
+        job = await jobs.get_job(plan_id)
+        if job is None:
+            raise UnknownPlanError(plan_id)
+        plan = await jobs.get_plan(plan_id)
+        if plan is None and job.state in {JobState.COMPLETED, JobState.PARTIAL_FAILED}:
+            raise UnknownPlanError(plan_id)
+        if plan is None and job.plan_id is None and job.error_code is None:
+            raise UnknownPlanError(plan_id)
+        return PlanJobResponse(job=JobView.from_record(job), plan=plan)
+
+    @app.post(
+        '/api/fill-actor/plans/{plan_id}/apply',
+        dependencies=[Depends(require_mutation_auth), Depends(require_ready)],
+    )
+    async def apply_plan(plan_id: str, request: ApplyPlanRequest) -> ApplyResult:
+        job = await jobs.get_job(plan_id)
+        if job is None:
+            raise UnknownPlanError(plan_id)
+        if job.state not in {JobState.COMPLETED, JobState.PARTIAL_FAILED}:
+            raise ApiError(409, 'plan_not_ready')
+        return await service.apply(
+            plan_id=plan_id,
+            revision=request.revision,
+            candidate_ids=request.candidate_ids,
+        )
+
+    @app.get('/api/health')
+    async def health() -> JSONResponse:
+        database_ready = await repository.health_check()
+        roots_ready = await service.roots_ready()
+        ready = database_ready and roots_ready
+        return JSONResponse(
+            {
+                'status': 'ok' if ready else 'not_ready',
+                'database': database_ready,
+                'roots': roots_ready,
+            },
+            status_code=200 if ready else 503,
+        )
+
+    if frontend_dist is not None and frontend_dist.is_dir():
+        app.mount('/', StaticFiles(directory=frontend_dist, html=True), name='frontend')
+    return app
+
+
+def _service_error_status(exc: FillActorError) -> int:
+    mappings: Sequence[tuple[type[FillActorError], int]] = (
+        (InvalidActorIdError, 422),
+        (TooManyActorsError, 422),
+        (TooManyVideosError, 422),
+        (UnknownPlanError, 404),
+        (ExpiredPlanError, 410),
+        (RevisionMismatchError, 409),
+        (UnknownCandidateError, 422),
+        (JobQueueFullError, 429),
+    )
+    return next((status for error_type, status in mappings if isinstance(exc, error_type)), 500)
