@@ -22,6 +22,25 @@ class JobOperation(StrEnum):
     APPLY = 'apply'
 
 
+class JobStage(StrEnum):
+    QUEUED = 'queued'
+    ACTOR_CATALOG = 'actor_catalog'
+    LIBRARY_SCAN = 'library_scan'
+    MAGNET_LOOKUP = 'magnet_lookup'
+    PERSISTING = 'persisting'
+    DONE = 'done'
+    UNKNOWN = 'unknown'
+
+
+class JobProgressUnit(StrEnum):
+    ACTORS = 'actors'
+    PAGES = 'pages'
+    VIDEOS = 'videos'
+    MAGNETS = 'magnets'
+    STEPS = 'steps'
+    ITEMS = 'items'
+
+
 class MoveJournalState(StrEnum):
     PREPARED = 'prepared'
     LINKED = 'linked'
@@ -73,6 +92,48 @@ class PlanRecord:
 
 
 @dataclass(frozen=True)
+class JobProgress:
+    stage: JobStage
+    completed: int
+    total: int | None
+    unit: JobProgressUnit
+    current: str | None
+    stage_started_at: datetime
+    updated_at: datetime
+
+    def __post_init__(self) -> None:
+        if self.completed < 0:
+            msg = 'job progress completed must not be negative'
+            raise ValueError(msg)
+        if self.total is not None and self.total < 0:
+            msg = 'job progress total must not be negative'
+            raise ValueError(msg)
+        if self.total is not None and self.completed > self.total:
+            msg = 'job progress completed must not exceed total'
+            raise ValueError(msg)
+
+
+@dataclass(frozen=True)
+class JobProgressEvent:
+    stage: JobStage
+    completed: int
+    total: int | None
+    unit: JobProgressUnit
+    current: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.completed < 0:
+            msg = 'job progress completed must not be negative'
+            raise ValueError(msg)
+        if self.total is not None and self.total < 0:
+            msg = 'job progress total must not be negative'
+            raise ValueError(msg)
+        if self.total is not None and self.completed > self.total:
+            msg = 'job progress completed must not exceed total'
+            raise ValueError(msg)
+
+
+@dataclass(frozen=True)
 class JobRecord:
     job_id: str
     operation: JobOperation
@@ -84,6 +145,23 @@ class JobRecord:
     owner_id: str | None = None
     lease_expires_at: datetime | None = None
     actor_ids: tuple[str, ...] = ()
+    progress: JobProgress | None = None
+
+    def __post_init__(self) -> None:
+        if self.progress is None:
+            object.__setattr__(
+                self,
+                'progress',
+                JobProgress(
+                    stage=JobStage.QUEUED,
+                    completed=0,
+                    total=len(self.actor_ids) if self.actor_ids else None,
+                    unit=JobProgressUnit.ACTORS if self.actor_ids else JobProgressUnit.ITEMS,
+                    current=None,
+                    stage_started_at=self.created_at,
+                    updated_at=self.updated_at,
+                ),
+            )
 
 
 @dataclass(frozen=True)
@@ -129,12 +207,33 @@ class FillActorRepository(Protocol):
         lease_expires_at: datetime,
     ) -> JobRecord | None: ...
 
-    async def update_owned_job(
+    async def renew_owned_job_lease(
         self,
-        record: JobRecord,
         *,
+        job_id: str,
         owner_id: str,
-        expected_states: Sequence[JobState],
+        now: datetime,
+        lease_expires_at: datetime,
+    ) -> bool: ...
+
+    async def update_owned_job_progress(
+        self,
+        *,
+        job_id: str,
+        owner_id: str,
+        progress: JobProgress,
+        now: datetime,
+    ) -> bool: ...
+
+    async def finish_owned_job(  # noqa: PLR0913
+        self,
+        *,
+        job_id: str,
+        owner_id: str,
+        state: JobState,
+        error_code: str | None,
+        now: datetime,
+        progress: JobProgress,
     ) -> bool: ...
 
     async def fail_expired_jobs(self, *, now: datetime, error_code: str) -> int: ...
@@ -264,18 +363,91 @@ class MemoryFillActorRepository:
             self._jobs[current.job_id] = claimed
             return claimed
 
-    async def update_owned_job(
+    async def renew_owned_job_lease(
         self,
-        record: JobRecord,
         *,
+        job_id: str,
         owner_id: str,
-        expected_states: Sequence[JobState],
+        now: datetime,
+        lease_expires_at: datetime,
     ) -> bool:
         async with self._lock:
-            current = self._jobs.get(record.job_id)
-            if current is None or current.owner_id != owner_id or current.state not in expected_states:
+            current = self._jobs.get(job_id)
+            if (
+                current is None
+                or current.owner_id != owner_id
+                or current.state is not JobState.RUNNING
+                or current.lease_expires_at is None
+                or normalize_datetime(current.lease_expires_at) <= normalize_datetime(now)
+            ):
                 return False
-            self._jobs[record.job_id] = record
+            self._jobs[job_id] = _replace_job(
+                current,
+                state=JobState.RUNNING,
+                updated_at=now,
+                owner_id=owner_id,
+                lease_expires_at=lease_expires_at,
+                progress=current.progress,
+            )
+            return True
+
+    async def update_owned_job_progress(
+        self,
+        *,
+        job_id: str,
+        owner_id: str,
+        progress: JobProgress,
+        now: datetime,
+    ) -> bool:
+        async with self._lock:
+            current = self._jobs.get(job_id)
+            if (
+                current is None
+                or current.owner_id != owner_id
+                or current.state is not JobState.RUNNING
+                or current.lease_expires_at is None
+                or normalize_datetime(current.lease_expires_at) <= normalize_datetime(now)
+            ):
+                return False
+            self._jobs[job_id] = _replace_job(
+                current,
+                state=JobState.RUNNING,
+                updated_at=current.updated_at,
+                owner_id=owner_id,
+                lease_expires_at=current.lease_expires_at,
+                progress=progress,
+            )
+            return True
+
+    async def finish_owned_job(  # noqa: PLR0913
+        self,
+        *,
+        job_id: str,
+        owner_id: str,
+        state: JobState,
+        error_code: str | None,
+        now: datetime,
+        progress: JobProgress,
+    ) -> bool:
+        async with self._lock:
+            current = self._jobs.get(job_id)
+            if (
+                current is None
+                or current.owner_id != owner_id
+                or current.state is not JobState.RUNNING
+                or current.lease_expires_at is None
+                or normalize_datetime(current.lease_expires_at) <= normalize_datetime(now)
+            ):
+                return False
+            self._jobs[job_id] = _replace_job(
+                current,
+                state=state,
+                updated_at=now,
+                error_code=error_code,
+                owner_id=None,
+                lease_expires_at=None,
+                progress=progress,
+            )
             return True
 
     async def fail_expired_jobs(self, *, now: datetime, error_code: str) -> int:
@@ -295,6 +467,7 @@ class MemoryFillActorRepository:
                     error_code=error_code,
                     owner_id=None,
                     lease_expires_at=None,
+                    progress=_terminal_progress(job.progress, now),
                 )
             return len(expired)
 
@@ -396,6 +569,7 @@ def _without_plan(record: JobRecord) -> JobRecord:
         owner_id=record.owner_id,
         lease_expires_at=record.lease_expires_at,
         actor_ids=record.actor_ids,
+        progress=record.progress,
     )
 
 
@@ -407,6 +581,7 @@ def _replace_job(  # noqa: PLR0913
     error_code: str | None = None,
     owner_id: str | None,
     lease_expires_at: datetime | None,
+    progress: JobProgress | None = None,
 ) -> JobRecord:
     return JobRecord(
         job_id=record.job_id,
@@ -419,4 +594,27 @@ def _replace_job(  # noqa: PLR0913
         owner_id=owner_id,
         lease_expires_at=lease_expires_at,
         actor_ids=record.actor_ids,
+        progress=progress if progress is not None else record.progress,
+    )
+
+
+def _terminal_progress(progress: JobProgress | None, now: datetime) -> JobProgress:
+    if progress is None:
+        return JobProgress(
+            stage=JobStage.DONE,
+            completed=0,
+            total=None,
+            unit=JobProgressUnit.ITEMS,
+            current=None,
+            stage_started_at=now,
+            updated_at=now,
+        )
+    return JobProgress(
+        stage=JobStage.DONE,
+        completed=progress.completed,
+        total=progress.total,
+        unit=progress.unit,
+        current=progress.current,
+        stage_started_at=now,
+        updated_at=now,
     )

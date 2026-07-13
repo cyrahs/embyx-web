@@ -10,12 +10,160 @@ from embyx_web.fill_actor.models import FillActorPlan, VideoState
 from embyx_web.fill_actor.persistence import (
     FillActorRepository,
     JobOperation,
+    JobProgress,
+    JobProgressEvent,
+    JobProgressUnit,
     JobRecord,
+    JobStage,
     JobState,
 )
 from embyx_web.fill_actor.service import FillActorService
 
 LOGGER = logging.getLogger(__name__)
+
+
+class _OwnedProgressReporter:
+    def __init__(
+        self,
+        *,
+        repository: FillActorRepository,
+        job: JobRecord,
+        owner_id: str,
+        clock: Callable[[], datetime],
+        flush_interval: float,
+    ) -> None:
+        if job.progress is None:  # pragma: no cover - JobRecord normalizes this invariant
+            msg = 'claimed job must have progress'
+            raise ValueError(msg)
+        self._repository = repository
+        self._job_id = job.job_id
+        self._owner_id = owner_id
+        self._clock = clock
+        self._flush_interval = flush_interval
+        self._current = job.progress
+        self._dirty = False
+        self._owned = True
+        self._closed = False
+        self._last_flush = 0.0
+        self._timer: asyncio.Task[None] | None = None
+        self._lock = asyncio.Lock()
+
+    async def __call__(self, event: JobProgressEvent) -> None:
+        async with self._lock:
+            if self._closed or not self._owned:
+                return
+            values = (event.stage, event.completed, event.total, event.unit, event.current)
+            current_values = (
+                self._current.stage,
+                self._current.completed,
+                self._current.total,
+                self._current.unit,
+                self._current.current,
+            )
+            if values == current_values:
+                return
+            now = self._clock()
+            scope_changed = (
+                event.stage is not self._current.stage
+                or event.unit is not self._current.unit
+                or event.completed < self._current.completed
+            )
+            self._current = JobProgress(
+                stage=event.stage,
+                completed=event.completed,
+                total=event.total,
+                unit=event.unit,
+                current=event.current,
+                stage_started_at=now if scope_changed else self._current.stage_started_at,
+                updated_at=now,
+            )
+            self._dirty = True
+            loop_time = asyncio.get_running_loop().time()
+            if scope_changed or self._last_flush == 0.0 or loop_time - self._last_flush >= self._flush_interval:
+                await self._flush_locked()
+            else:
+                self._schedule_locked()
+
+    async def finish(self, state: JobState, *, error_code: str | None = None) -> bool:
+        timer: asyncio.Task[None] | None
+        async with self._lock:
+            if self._closed:
+                return False
+            self._closed = True
+            timer = self._timer
+            self._timer = None
+            now = self._clock()
+            progress = JobProgress(
+                stage=JobStage.DONE,
+                completed=self._current.completed,
+                total=self._current.total,
+                unit=self._current.unit,
+                current=self._current.current,
+                stage_started_at=now,
+                updated_at=now,
+            )
+        if timer is not None:
+            timer.cancel()
+            await asyncio.gather(timer, return_exceptions=True)
+        if not self._owned:
+            return False
+        return await self._repository.finish_owned_job(
+            job_id=self._job_id,
+            owner_id=self._owner_id,
+            state=state,
+            error_code=error_code,
+            now=now,
+            progress=progress,
+        )
+
+    async def mark_unowned(self) -> None:
+        timer: asyncio.Task[None] | None
+        async with self._lock:
+            self._owned = False
+            self._dirty = False
+            timer = self._timer
+            self._timer = None
+        if timer is not None:
+            timer.cancel()
+            await asyncio.gather(timer, return_exceptions=True)
+
+    async def _flush_locked(self) -> None:
+        if not self._dirty or not self._owned or self._closed:
+            return
+        attempted_at = asyncio.get_running_loop().time()
+        try:
+            owned = await self._repository.update_owned_job_progress(
+                job_id=self._job_id,
+                owner_id=self._owner_id,
+                progress=self._current,
+                now=self._clock(),
+            )
+        except Exception:
+            LOGGER.exception('fill-actor job progress update failed; retrying')
+            self._last_flush = attempted_at
+            self._schedule_locked()
+            return
+        if not owned:
+            self._owned = False
+            self._dirty = False
+            return
+        self._dirty = False
+        self._last_flush = attempted_at
+
+    def _schedule_locked(self) -> None:
+        if self._timer is not None or self._closed or not self._owned:
+            return
+        elapsed = asyncio.get_running_loop().time() - self._last_flush
+        delay = max(self._flush_interval - elapsed, 0.0)
+        self._timer = asyncio.create_task(self._flush_after(delay), name=f'fill-actor-progress-{self._job_id}')
+
+    async def _flush_after(self, delay: float) -> None:
+        await asyncio.sleep(delay)
+        async with self._lock:
+            self._timer = None
+            await self._flush_locked()
+            if self._dirty:
+                self._schedule_locked()
 
 
 class FillActorJobManager:
@@ -30,11 +178,12 @@ class FillActorJobManager:
         max_active_jobs: int = 32,
         lease_duration: timedelta = timedelta(seconds=30),
         poll_interval: float = 0.25,
+        progress_flush_interval: float = 0.75,
     ) -> None:
         if max_concurrent_jobs < 1 or max_active_jobs < max_concurrent_jobs:
             msg = 'job capacity must be positive and at least the worker count'
             raise ValueError(msg)
-        if lease_duration <= timedelta(0) or poll_interval <= 0:
+        if lease_duration <= timedelta(0) or poll_interval <= 0 or progress_flush_interval <= 0:
             msg = 'job lease and poll interval must be positive'
             raise ValueError(msg)
         self._service = service
@@ -46,6 +195,7 @@ class FillActorJobManager:
         self._max_active_jobs = max_active_jobs
         self._lease_duration = lease_duration
         self._poll_interval = poll_interval
+        self._progress_flush_interval = progress_flush_interval
         self._wake = asyncio.Event()
         self._lifecycle_lock = asyncio.Lock()
         self._workers: tuple[asyncio.Task[None], ...] = ()
@@ -76,6 +226,15 @@ class FillActorJobManager:
             created_at=now,
             updated_at=now,
             actor_ids=normalized,
+            progress=JobProgress(
+                stage=JobStage.QUEUED,
+                completed=0,
+                total=len(normalized),
+                unit=JobProgressUnit.ACTORS,
+                current=None,
+                stage_started_at=now,
+                updated_at=now,
+            ),
         )
         if not await self._repository.enqueue_job(job, max_active=self._max_active_jobs):
             raise JobQueueFullError(str(self._max_active_jobs))
@@ -130,56 +289,53 @@ class FillActorJobManager:
                 await asyncio.sleep(self._poll_interval)
 
     async def _run_plan(self, job: JobRecord) -> None:
-        heartbeat = asyncio.create_task(self._heartbeat(job))
+        reporter = _OwnedProgressReporter(
+            repository=self._repository,
+            job=job,
+            owner_id=self._owner_id,
+            clock=self._now,
+            flush_interval=self._progress_flush_interval,
+        )
+        heartbeat = asyncio.create_task(self._heartbeat(job, reporter))
         try:
-            plan = await self._service.create_plan(job.actor_ids, plan_id=job.plan_id)
+            plan = await self._service.create_plan(job.actor_ids, plan_id=job.plan_id, progress=reporter)
         except asyncio.CancelledError:
             await self._stop_heartbeat(heartbeat)
-            await asyncio.shield(self._save_terminal(job, JobState.FAILED, error_code='job_interrupted'))
+            await asyncio.shield(self._finish_terminal(reporter, JobState.FAILED, error_code='job_interrupted'))
             raise
         except FillActorError as exc:
             await self._stop_heartbeat(heartbeat)
-            await self._save_terminal(job, JobState.FAILED, error_code=exc.code)
+            await self._finish_terminal(reporter, JobState.FAILED, error_code=exc.code)
             return
         except Exception:  # noqa: BLE001
             await self._stop_heartbeat(heartbeat)
-            await self._save_terminal(job, JobState.FAILED, error_code='plan_creation_failed')
+            await self._finish_terminal(reporter, JobState.FAILED, error_code='plan_creation_failed')
             return
 
         await self._stop_heartbeat(heartbeat)
         partial = any(actor.error_code is not None for actor in plan.actors) or any(
             video.state is VideoState.SCAN_FAILED or bool(video.warnings) for video in plan.videos
         )
-        saved = await self._save_terminal(job, JobState.PARTIAL_FAILED if partial else JobState.COMPLETED)
+        saved = await self._finish_terminal(reporter, JobState.PARTIAL_FAILED if partial else JobState.COMPLETED)
         if not saved:
             LOGGER.warning(
                 'plan %s completed after its job lease was lost; retaining it for audited TTL cleanup',
                 plan.plan_id,
             )
 
-    async def _heartbeat(self, job: JobRecord) -> None:
+    async def _heartbeat(self, job: JobRecord, reporter: _OwnedProgressReporter) -> None:
         interval = max(self._lease_duration.total_seconds() / 3, 0.05)
         retry_interval = min(self._poll_interval, interval)
         while True:
             await asyncio.sleep(interval)
             while True:
                 now = self._now()
-                refreshed = JobRecord(
-                    job_id=job.job_id,
-                    plan_id=job.plan_id,
-                    operation=job.operation,
-                    state=JobState.RUNNING,
-                    created_at=job.created_at,
-                    updated_at=now,
-                    owner_id=self._owner_id,
-                    lease_expires_at=now + self._lease_duration,
-                    actor_ids=job.actor_ids,
-                )
                 try:
-                    owned = await self._repository.update_owned_job(
-                        refreshed,
+                    owned = await self._repository.renew_owned_job_lease(
+                        job_id=job.job_id,
                         owner_id=self._owner_id,
-                        expected_states=(JobState.RUNNING,),
+                        now=now,
+                        lease_expires_at=now + self._lease_duration,
                     )
                 except asyncio.CancelledError:
                     raise
@@ -188,6 +344,7 @@ class FillActorJobManager:
                     await asyncio.sleep(retry_interval)
                     continue
                 if not owned:
+                    await reporter.mark_unowned()
                     return
                 break
 
@@ -202,27 +359,18 @@ class FillActorJobManager:
             except Exception:
                 LOGGER.exception('fill-actor job reaper iteration failed')
 
-    async def _save_terminal(
-        self,
-        job: JobRecord,
+    @staticmethod
+    async def _finish_terminal(
+        reporter: _OwnedProgressReporter,
         state: JobState,
         *,
         error_code: str | None = None,
     ) -> bool:
-        return await self._repository.update_owned_job(
-            JobRecord(
-                job_id=job.job_id,
-                plan_id=job.plan_id,
-                operation=job.operation,
-                state=state,
-                created_at=job.created_at,
-                updated_at=self._now(),
-                error_code=error_code,
-                actor_ids=job.actor_ids,
-            ),
-            owner_id=self._owner_id,
-            expected_states=(JobState.RUNNING,),
-        )
+        try:
+            return await reporter.finish(state, error_code=error_code)
+        except Exception:
+            LOGGER.exception('fill-actor terminal job update failed')
+            return False
 
     @staticmethod
     async def _stop_heartbeat(task: asyncio.Task[None]) -> None:

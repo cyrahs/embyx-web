@@ -97,12 +97,111 @@ describe('Fill Actor page', () => {
     await user.click(screen.getByRole('button', { name: '开始扫描' }))
 
     expect(await screen.findByText('任务已排队')).toBeInTheDocument()
+    expect(screen.getByRole('progressbar', { name: '任务已排队进度' })).not.toHaveAttribute('aria-valuenow')
+    expect(screen.getByRole('progressbar', { name: '任务已排队进度' })).toHaveAttribute('aria-valuetext', '进度计算中')
     expect(await screen.findByText('扫描结果', {}, { timeout: 2_000 })).toBeInTheDocument()
     expect(fetchMock).toHaveBeenNthCalledWith(
       3,
       '/api/fill-actor/plans/plan-1',
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      expect.objectContaining({ cache: 'no-store', signal: expect.any(AbortSignal) }),
     )
+  })
+
+  it('renders stage progress, timing, ETA, freshness warnings, and accessible progress semantics', async () => {
+    const user = userEvent.setup()
+    const fetchMock = vi.mocked(fetch)
+    const now = Date.now()
+    const running = {
+      job: {
+        job_id: 'job-1',
+        plan_id: 'plan-1',
+        state: 'running',
+        updated_at: new Date(now - 36_000).toISOString(),
+        progress: {
+          stage: 'library_scan',
+          completed: 3,
+          total: 10,
+          unit: 'videos',
+          current: 'ABC-004',
+          stage_started_at: new Date(now - 125_000).toISOString(),
+          updated_at: new Date(now - 61_000).toISOString(),
+          percent: 30,
+          eta_seconds: 95,
+          elapsed_seconds: 125,
+          last_progress_seconds: 61,
+        },
+      },
+      plan: null,
+    }
+    fetchMock
+      .mockImplementationOnce(() => jsonResponse({ status: 'ok' }))
+      .mockImplementation(() => jsonResponse(running, 202))
+
+    render(<App />)
+    await user.type(screen.getByLabelText('演员 ID'), 'A123')
+    await user.click(screen.getByRole('button', { name: '开始扫描' }))
+
+    expect(await screen.findByText('正在扫描本地片库')).toBeInTheDocument()
+    expect(screen.getByText('当前：ABC-004')).toBeInTheDocument()
+    expect(screen.getByText('3 / 10 个作品')).toBeInTheDocument()
+    expect(screen.getByText(/2 分 [5-7] 秒/)).toBeInTheDocument()
+    expect(screen.getByText('约 1 分 35 秒')).toBeInTheDocument()
+    expect(screen.getByText(/1 分 [1-3] 秒前/)).toBeInTheDocument()
+    expect(screen.getByText('较长时间无新结果，仍可能在等待外部服务。')).toBeInTheDocument()
+    expect(screen.getByText('执行器心跳已较长时间未更新，执行可能已经中断。')).toBeInTheDocument()
+    expect(screen.getByRole('progressbar', { name: '正在扫描本地片库进度' })).toHaveAttribute('aria-valuenow', '30')
+    expect(screen.getByRole('progressbar', { name: '正在扫描本地片库进度' })).toHaveAttribute(
+      'aria-valuetext',
+      '3 / 10 个作品',
+    )
+    const elapsedValue = screen.getByText('阶段已用时').parentElement?.querySelector('dd') ?? null
+    expect(elapsedValue).not.toBeNull()
+    const initialElapsed = elapsedValue?.textContent ?? ''
+    await waitFor(() => expect(elapsedValue).not.toHaveTextContent(initialElapsed), { timeout: 1_800 })
+  })
+
+  it('keeps a running task through a transient poll failure and retries automatically', async () => {
+    const user = userEvent.setup()
+    const fetchMock = vi.mocked(fetch)
+    fetchMock
+      .mockImplementationOnce(() => jsonResponse({ status: 'ok' }))
+      .mockImplementationOnce(() => jsonResponse({ job: { job_id: 'job-1', plan_id: 'plan-1', state: 'running' }, plan: null }, 202))
+      .mockImplementationOnce(() => Promise.reject(new TypeError('temporary offline')))
+      .mockImplementationOnce(() => jsonResponse({ job: { job_id: 'job-1', plan_id: 'plan-1', state: 'completed' }, plan }))
+
+    render(<App />)
+    await user.type(screen.getByLabelText('演员 ID'), 'A123')
+    await user.click(screen.getByRole('button', { name: '开始扫描' }))
+
+    expect(await screen.findByText('暂时无法刷新任务状态，将自动重试。', {}, { timeout: 2_000 })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '正在扫描' })).toBeDisabled()
+    expect(screen.queryByText('操作未完成')).not.toBeInTheDocument()
+    expect(await screen.findByText('扫描结果', {}, { timeout: 4_000 })).toBeInTheDocument()
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      4,
+      '/api/fill-actor/plans/plan-1',
+      expect.objectContaining({ cache: 'no-store', signal: expect.any(AbortSignal) }),
+    )
+  })
+
+  it('recovers an active scan from session storage and clears it after completion', async () => {
+    window.sessionStorage.setItem('embyx-web-active-plan-id', 'resume-1')
+    const resumedPlan = { ...plan, plan_id: 'resume-1' }
+    const fetchMock = vi.mocked(fetch)
+    fetchMock
+      .mockImplementationOnce(() => jsonResponse({ status: 'ok' }))
+      .mockImplementationOnce(() => jsonResponse({ job: { job_id: 'resume-1', plan_id: 'resume-1', state: 'completed' }, plan: resumedPlan }))
+
+    render(<App />)
+
+    expect(await screen.findByText('正在恢复扫描状态')).toBeInTheDocument()
+    expect(await screen.findByText('扫描结果', {}, { timeout: 2_000 })).toBeInTheDocument()
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      '/api/fill-actor/plans/resume-1',
+      expect.objectContaining({ cache: 'no-store', signal: expect.any(AbortSignal) }),
+    )
+    await waitFor(() => expect(window.sessionStorage.getItem('embyx-web-active-plan-id')).toBeNull())
   })
 
   it('requires confirmation, displays per-file apply results, and copies magnet text', async () => {
