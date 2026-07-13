@@ -13,8 +13,10 @@ and a packaged React management page while keeping filesystem mutation independe
   fallback for NFS servers that reject rename flags, plus a cross-process advisory lock.
 - Recovery for current atomic moves and legacy `prepared`, `linked`, and `source_removed` journal states.
 - FastAPI endpoints with stable JSON error codes, request/actor/video limits, readiness checks, and Bearer auth for writes.
-- React + TypeScript + Vite UI with polling, grouped results, move confirmation, conflicts, partial failures, safe magnet
-  actions, and stale-plan recovery.
+- React + TypeScript + Vite UI with polling, grouped results, move confirmation, conflicts, partial failures, one-click
+  bulk magnet copying, RSSHub cache readiness, FreshRSS hand-off, and stale-plan recovery.
+- Per-actor RSSHub feed prewarming persisted alongside scan jobs, with lease-fenced updates and cache-HIT detection before
+  a FreshRSS subscription action is exposed.
 - Static frontend assets included in the Python wheel.
 - A lazy, origin-checked adapter boundary for a narrow `embyx` compatibility API; tests never load legacy secrets.
 
@@ -65,6 +67,8 @@ The production bootstrap reads only explicit `EMBYX_WEB_*` variables:
 | `EMBYX_WEB_MAX_REQUEST_BYTES` | Maximum mutation body | `65536` |
 | `EMBYX_WEB_MAX_ACTORS` / `EMBYX_WEB_MAX_VIDEOS` | Per-plan limits | `20` / `2000` |
 | `EMBYX_WEB_MAGNET_CONCURRENCY` | Process-wide lookup concurrency | `8` |
+| `EMBYX_WEB_RSSHUB_URL` | Cluster-local RSSHub base URL used to prewarm actor feeds; set empty to disable | `http://rsshub.rss.svc.cluster.local` |
+| `EMBYX_WEB_FRESHRSS_URL` | FreshRSS browser base URL used to build the prefilled add-subscription action | disabled |
 
 Create the sentinel deliberately in the actual mounted filesystem of the actor root, every additional root, and the
 move-in root. A missing marker makes readiness fail and prevents scanning/reconciliation, protecting against an empty
@@ -102,14 +106,20 @@ or mounting the media PVC cannot supply code that is absent from the image.
 ## API
 
 - `POST /api/fill-actor/plans` validates actor IDs and atomically enqueues a persisted job.
-- `GET /api/fill-actor/plans/{plan_id}` returns `{job, plan}`; a plan is published only after a successful terminal job
-  state.
+- `GET /api/fill-actor/plans/{plan_id}` returns `{job, plan, feeds}`. The plan becomes visible once its scan result is
+  persisted; the job can remain running briefly while per-actor RSSHub cache probes reach a terminal state.
 - `POST /api/fill-actor/plans/{plan_id}/apply` accepts only a published plan and applies opaque candidate IDs with
   revision checking.
 - `GET /api/health` reports database write-readiness and root/sentinel readiness.
 
 Responses never expose private paths or raw exception messages. The queue defaults to 2 workers and at most 32 active
 queued/running jobs per process configuration.
+
+When RSSHub integration is enabled, each scan schedules the cluster-local `/javbus/star/{actor-id}` request before
+actor catalog scanning begins. A background `HEAD` probe waits for a successful XML response carrying
+`RSSHub-Cache-Status: HIT`; cache failures do not fail the library scan. Once ready, the UI builds FreshRSS's standard
+prefilled add-feed URL from `EMBYX_WEB_FRESHRSS_URL`. The user remains inside FreshRSS's normal authenticated and CSRF
+protected confirmation flow, so embyx-web never stores FreshRSS credentials.
 
 ## Frontend and packaging
 

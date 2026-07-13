@@ -45,6 +45,7 @@ async def aclose():
         embyx_runtime_path=tmp_path / 'runtime',
         embyx_runtime_module='bootstrap_runtime.api',
         move_in_by_brand=True,
+        rsshub_url=None,
     )
 
     with TestClient(build_app(settings)) as client:

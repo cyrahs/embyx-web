@@ -3,6 +3,7 @@ from pathlib import Path
 from fastapi import FastAPI
 
 from embyx_web.api import create_app
+from embyx_web.fill_actor.feeds import RSSHubFeedWarmer
 from embyx_web.fill_actor.jobs import FillActorJobManager
 from embyx_web.fill_actor.service import FillActorPaths, FillActorService
 from embyx_web.fill_actor.sqlite_repository import SQLiteFillActorRepository
@@ -39,7 +40,16 @@ def build_app(settings: Settings) -> FastAPI:
         repository=repository,
         mutation_lock=AsyncFileLock(settings.mutation_lock_path),
     )
-    jobs = FillActorJobManager(service=service, repository=repository)
+    feed_warmer = (
+        RSSHubFeedWarmer(
+            repository=repository,
+            rsshub_url=settings.rsshub_url,
+            freshrss_url=settings.freshrss_url,
+        )
+        if settings.rsshub_url is not None
+        else None
+    )
+    jobs = FillActorJobManager(service=service, repository=repository, feed_warmer=feed_warmer)
     frontend_dist = Path(__file__).resolve().parent / 'static'
     return create_app(
         service=service,

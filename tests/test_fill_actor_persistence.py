@@ -19,6 +19,9 @@ from embyx_web.fill_actor.persistence import (
     CandidateRecord,
     FileFingerprint,
     InvalidMoveJournalTransitionError,
+    JobFeedErrorCode,
+    JobFeedRecord,
+    JobFeedState,
     JobOperation,
     JobProgress,
     JobProgressUnit,
@@ -354,6 +357,7 @@ def test_sqlite_repository_applies_explicit_schema_migration(tmp_path: Path) -> 
         'candidates',
         'move_results',
         'jobs',
+        'job_feeds',
         'move_journal',
         'health_probe',
     }
@@ -504,6 +508,75 @@ async def test_lease_and_progress_updates_do_not_overwrite_each_other(
     still_running = await repository.get_job(claimed.job_id)
     assert still_running is not None
     assert still_running.state is JobState.RUNNING
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('repository_kind', ['memory', 'sqlite'])
+async def test_job_feed_updates_require_current_owner_and_unexpired_lease(
+    tmp_path: Path,
+    repository_kind: str,
+) -> None:
+    repository = make_repository(repository_kind, tmp_path)
+    now = datetime(2026, 7, 13, 10, 0, tzinfo=UTC)
+    queued = JobRecord(
+        job_id='feed-job',
+        plan_id='feed-job',
+        operation=JobOperation.CREATE_PLAN,
+        state=JobState.QUEUED,
+        created_at=now,
+        updated_at=now,
+        actor_ids=('actor',),
+    )
+    feed = JobFeedRecord(
+        job_id=queued.job_id,
+        actor_id='actor',
+        state=JobFeedState.QUEUED,
+        attempts=0,
+        updated_at=now,
+        freshrss_add_url='https://rss.example/i/?c=feed&a=add',
+    )
+    assert await repository.enqueue_job(queued, max_active=1, feeds=(feed,))
+    claimed = await repository.claim_next_job(
+        owner_id='current-owner',
+        now=now,
+        lease_expires_at=now + timedelta(seconds=30),
+    )
+    assert claimed is not None
+
+    assert await repository.update_owned_job_feed(
+        job_id=queued.job_id,
+        actor_id='actor',
+        owner_id='current-owner',
+        state=JobFeedState.WARMING,
+        attempts=1,
+        error_code=None,
+        now=now + timedelta(seconds=1),
+    )
+    assert not await repository.update_owned_job_feed(
+        job_id=queued.job_id,
+        actor_id='actor',
+        owner_id='stale-owner',
+        state=JobFeedState.READY,
+        attempts=2,
+        error_code=None,
+        now=now + timedelta(seconds=2),
+    )
+    assert not await repository.update_owned_job_feed(
+        job_id=queued.job_id,
+        actor_id='actor',
+        owner_id='current-owner',
+        state=JobFeedState.READY,
+        attempts=2,
+        error_code=None,
+        now=now + timedelta(seconds=31),
+    )
+
+    assert await repository.fail_expired_jobs(now=now + timedelta(seconds=31), error_code='job_interrupted') == 1
+    saved = (await repository.list_job_feeds(queued.job_id))[0]
+    assert saved.state is JobFeedState.FAILED
+    assert saved.attempts == 1
+    assert saved.error_code is JobFeedErrorCode.CANCELLED
+    assert saved.freshrss_add_url == feed.freshrss_add_url
 
 
 def test_sqlite_repository_rejects_unknown_future_schema(tmp_path: Path) -> None:

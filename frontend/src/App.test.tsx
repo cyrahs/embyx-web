@@ -47,6 +47,40 @@ const plan: FillActorPlan = {
   ],
 }
 
+const magnetPlan: FillActorPlan = {
+  ...plan,
+  videos: [
+    ...plan.videos,
+    {
+      video_id: 'XYZ-003',
+      actor_ids: ['B456'],
+      state: 'magnet_found',
+      existing_files: [],
+      move_candidates: [],
+      magnet: 'magnet:?xt=urn:btih:ABCDEF',
+      warnings: [],
+    },
+    {
+      video_id: 'XYZ-004',
+      actor_ids: ['B456'],
+      state: 'magnet_found',
+      existing_files: [],
+      move_candidates: [],
+      magnet: 'magnet:?xt=urn:btih:123456',
+      warnings: [],
+    },
+    {
+      video_id: 'XYZ-005',
+      actor_ids: ['B456'],
+      state: 'magnet_found',
+      existing_files: [],
+      move_candidates: [],
+      magnet: 'https://example.com/not-a-magnet',
+      warnings: [],
+    },
+  ],
+}
+
 function jsonResponse(body: unknown, status = 200) {
   return Promise.resolve(new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } }))
 }
@@ -204,9 +238,8 @@ describe('Fill Actor page', () => {
     await waitFor(() => expect(window.sessionStorage.getItem('embyx-web-active-plan-id')).toBeNull())
   })
 
-  it('requires confirmation, displays per-file apply results, and copies magnet text', async () => {
+  it('requires confirmation and displays per-file apply results', async () => {
     const user = userEvent.setup()
-    const clipboardSpy = vi.spyOn(navigator.clipboard, 'writeText')
     const fetchMock = vi.mocked(fetch)
     fetchMock
       .mockImplementationOnce(() => jsonResponse({ status: 'ok' }))
@@ -237,10 +270,94 @@ describe('Fill Actor page', () => {
       '/api/fill-actor/plans/plan-1/apply',
       expect.objectContaining({ body: JSON.stringify({ revision: 'revision-1', candidate_ids: ['safe-1'] }) }),
     )
+  })
 
-    await user.click(screen.getByRole('button', { name: '复制 XYZ-002 磁力链接' }))
-    expect(clipboardSpy).toHaveBeenCalledWith('magnet:?xt=urn:btih:123456')
-    expect(screen.getByRole('link', { name: '打开 XYZ-002 磁力链接' })).toHaveAttribute('rel', 'noopener noreferrer')
+  it('copies every valid unique magnet in plan order and has no per-row magnet actions', async () => {
+    const user = userEvent.setup()
+    const clipboardSpy = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue()
+    const fetchMock = vi.mocked(fetch)
+    fetchMock
+      .mockImplementationOnce(() => jsonResponse({ status: 'ok' }))
+      .mockImplementationOnce(() => jsonResponse(magnetPlan))
+
+    render(<App />)
+    await user.type(screen.getByLabelText('演员 ID'), 'A123')
+    await user.click(screen.getByRole('button', { name: '开始扫描' }))
+    await screen.findByText('扫描结果')
+
+    expect(screen.queryByRole('button', { name: /复制 .*磁力链接/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: /打开 .*磁力链接/ })).not.toBeInTheDocument()
+    expect(document.querySelector('a[href^="magnet:"]')).toBeNull()
+
+    await user.click(screen.getByRole('button', { name: '复制全部磁力（2）' }))
+    expect(clipboardSpy).toHaveBeenCalledTimes(1)
+    expect(clipboardSpy).toHaveBeenCalledWith(
+      'magnet:?xt=urn:btih:123456\nmagnet:?xt=urn:btih:ABCDEF',
+    )
+    expect(screen.getByRole('button', { name: '已复制 2 个磁力' })).toBeInTheDocument()
+  })
+
+  it('keeps polling completed plans while RSSHub warms and retains terminal feed states', async () => {
+    const user = userEvent.setup()
+    const fetchMock = vi.mocked(fetch)
+    const warmingFeed = {
+      actor_id: 'A123',
+      state: 'warming',
+      attempts: 1,
+      updated_at: '2026-07-13T10:01:00Z',
+      error_code: null,
+      freshrss_add_url: 'https://freshrss.example/i/?c=feed&a=add',
+    }
+    const readyFeed = {
+      ...warmingFeed,
+      state: 'ready',
+      attempts: 2,
+      updated_at: '2026-07-13T10:02:00Z',
+      freshrss_add_url: 'https://freshrss.example/i/?c=subscription&a=add&url_rss=https%3A%2F%2Frsshub.example%2Factress%2FA123',
+    }
+    const failedFeed = {
+      actor_id: 'B456',
+      state: 'failed',
+      attempts: 3,
+      updated_at: '2026-07-13T10:02:00Z',
+      error_code: 'rsshub_timeout',
+      freshrss_add_url: null,
+    }
+    fetchMock
+      .mockImplementationOnce(() => jsonResponse({ status: 'ok' }))
+      .mockImplementationOnce(() => jsonResponse({
+        job: { job_id: 'job-1', plan_id: 'plan-1', state: 'completed' },
+        plan,
+        feeds: [warmingFeed],
+      }))
+      .mockImplementationOnce(() => jsonResponse({
+        job: { job_id: 'job-1', plan_id: 'plan-1', state: 'completed' },
+        plan,
+        feeds: [readyFeed, failedFeed],
+      }))
+
+    render(<App />)
+    await user.type(screen.getByLabelText('演员 ID'), 'A123')
+    await user.click(screen.getByRole('button', { name: '开始扫描' }))
+
+    expect(await screen.findByText('缓存预热中')).toBeInTheDocument()
+    expect(screen.getByText('RSSHub 正在预热缓存，页面会自动更新。')).toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: '一键添加到 FreshRSS' })).not.toBeInTheDocument()
+
+    const addLink = await screen.findByRole('link', { name: '一键添加到 FreshRSS' }, { timeout: 2_000 })
+    expect(addLink).toHaveAttribute('href', readyFeed.freshrss_add_url)
+    expect(addLink).toHaveAttribute('target', '_blank')
+    expect(addLink).toHaveAttribute('rel', 'noopener noreferrer')
+    expect(screen.getByText('缓存已就绪')).toBeInTheDocument()
+    expect(screen.getByText('缓存失败')).toBeInTheDocument()
+    expect(screen.getByText('错误：rsshub_timeout')).toBeInTheDocument()
+    expect(screen.getByText('已尝试 2 次', { exact: false })).toBeInTheDocument()
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      '/api/fill-actor/plans/plan-1',
+      expect.objectContaining({ cache: 'no-store', signal: expect.any(AbortSignal) }),
+    )
+    expect(fetchMock).toHaveBeenCalledTimes(3)
   })
 
   it('shows an explicit recovery action when apply reports an expired plan', async () => {

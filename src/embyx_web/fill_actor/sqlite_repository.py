@@ -10,6 +10,9 @@ from embyx_web.fill_actor.models import FillActorPlan, MoveResult
 from embyx_web.fill_actor.persistence import (
     CandidateRecord,
     FileFingerprint,
+    JobFeedErrorCode,
+    JobFeedRecord,
+    JobFeedState,
     JobOperation,
     JobProgress,
     JobProgressUnit,
@@ -23,7 +26,7 @@ from embyx_web.fill_actor.persistence import (
     validate_journal_transition,
 )
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 
 async def _run_sync[ResultT](function: Callable[..., ResultT], *args: object) -> ResultT:
@@ -149,6 +152,29 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
             progress_updated_at = updated_at
         """,
     ),
+    4: (
+        """
+        CREATE TABLE job_feeds (
+            job_id TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('queued', 'warming', 'ready', 'failed')),
+            attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+            updated_at TEXT NOT NULL,
+            error_code TEXT CHECK (error_code IS NULL OR error_code IN (
+                'rsshub_timeout', 'rsshub_network_error', 'rsshub_http_error',
+                'rsshub_invalid_feed', 'rsshub_not_ready', 'rsshub_cancelled'
+            )),
+            freshrss_add_url TEXT,
+            CHECK (
+                (state = 'failed' AND error_code IS NOT NULL)
+                OR (state != 'failed' AND error_code IS NULL)
+            ),
+            PRIMARY KEY (job_id, actor_id),
+            FOREIGN KEY (job_id) REFERENCES jobs (job_id) ON DELETE CASCADE
+        )
+        """,
+        'CREATE INDEX job_feeds_state_idx ON job_feeds (state, updated_at)',
+    ),
 }
 
 
@@ -185,8 +211,14 @@ class SQLiteFillActorRepository:
     async def save_job(self, record: JobRecord) -> None:
         await _run_sync(self._save_job, record)
 
-    async def enqueue_job(self, record: JobRecord, *, max_active: int) -> bool:
-        return await _run_sync(self._enqueue_job, record, max_active)
+    async def enqueue_job(
+        self,
+        record: JobRecord,
+        *,
+        max_active: int,
+        feeds: Sequence[JobFeedRecord] = (),
+    ) -> bool:
+        return await _run_sync(self._enqueue_job, record, max_active, feeds)
 
     async def claim_next_job(
         self,
@@ -237,6 +269,31 @@ class SQLiteFillActorRepository:
 
     async def list_jobs(self, states: Sequence[JobState] | None = None) -> tuple[JobRecord, ...]:
         return await _run_sync(self._list_jobs, states)
+
+    async def list_job_feeds(self, job_id: str) -> tuple[JobFeedRecord, ...]:
+        return await _run_sync(self._list_job_feeds, job_id)
+
+    async def update_owned_job_feed(  # noqa: PLR0913
+        self,
+        *,
+        job_id: str,
+        actor_id: str,
+        owner_id: str,
+        state: JobFeedState,
+        attempts: int,
+        error_code: JobFeedErrorCode | None,
+        now: datetime,
+    ) -> bool:
+        return await _run_sync(
+            self._update_owned_job_feed,
+            job_id,
+            actor_id,
+            owner_id,
+            state,
+            attempts,
+            error_code,
+            now,
+        )
 
     async def save_move_journal(self, record: MoveJournalRecord) -> None:
         await _run_sync(self._save_move_journal, record)
@@ -456,14 +513,42 @@ class SQLiteFillActorRepository:
         with closing(self._connect()) as connection, connection:
             self._execute_save_job(connection, record)
 
-    def _enqueue_job(self, record: JobRecord, max_active: int) -> bool:
+    def _enqueue_job(
+        self,
+        record: JobRecord,
+        max_active: int,
+        feeds: Sequence[JobFeedRecord],
+    ) -> bool:
         with closing(self._connect()) as connection, connection:
             connection.execute('BEGIN IMMEDIATE')
             active = connection.execute("SELECT COUNT(*) FROM jobs WHERE state IN ('queued', 'running')").fetchone()[0]
             exists = connection.execute('SELECT 1 FROM jobs WHERE job_id = ?', (record.job_id,)).fetchone()
             if active >= max_active or exists is not None:
                 return False
+            feed_keys = [(feed.job_id, feed.actor_id) for feed in feeds]
+            if any(feed.job_id != record.job_id for feed in feeds) or len(feed_keys) != len(set(feed_keys)):
+                msg = 'job feeds must be unique and belong to the enqueued job'
+                raise ValueError(msg)
             self._execute_save_job(connection, record)
+            connection.executemany(
+                """
+                INSERT INTO job_feeds (
+                    job_id, actor_id, state, attempts, updated_at, error_code, freshrss_add_url
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    (
+                        feed.job_id,
+                        feed.actor_id,
+                        feed.state.value,
+                        feed.attempts,
+                        _datetime_to_text(feed.updated_at),
+                        feed.error_code,
+                        feed.freshrss_add_url,
+                    )
+                    for feed in feeds
+                ),
+            )
             return True
 
     def _claim_next_job(
@@ -583,22 +668,50 @@ class SQLiteFillActorRepository:
 
     def _fail_expired_jobs(self, now: datetime, error_code: str) -> int:
         with closing(self._connect()) as connection, connection:
-            cursor = connection.execute(
+            connection.execute('BEGIN IMMEDIATE')
+            expired_rows = connection.execute(
+                """
+                SELECT job_id FROM jobs
+                WHERE state = 'running' AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+                """,
+                (_datetime_to_text(now),),
+            ).fetchall()
+            if not expired_rows:
+                return 0
+            connection.executemany(
                 """
                 UPDATE jobs
                 SET state = 'failed', updated_at = ?, error_code = ?, owner_id = NULL, lease_expires_at = NULL,
                     progress_stage = 'done', progress_stage_started_at = ?, progress_updated_at = ?
-                WHERE state = 'running' AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+                WHERE job_id = ? AND state = 'running'
                 """,
                 (
-                    _datetime_to_text(now),
-                    error_code,
-                    _datetime_to_text(now),
-                    _datetime_to_text(now),
-                    _datetime_to_text(now),
+                    (
+                        _datetime_to_text(now),
+                        error_code,
+                        _datetime_to_text(now),
+                        _datetime_to_text(now),
+                        row['job_id'],
+                    )
+                    for row in expired_rows
                 ),
             )
-            return cursor.rowcount
+            connection.executemany(
+                """
+                UPDATE job_feeds
+                SET state = 'failed', updated_at = ?, error_code = ?
+                WHERE job_id = ? AND state IN ('queued', 'warming')
+                """,
+                (
+                    (
+                        _datetime_to_text(now),
+                        JobFeedErrorCode.CANCELLED.value,
+                        row['job_id'],
+                    )
+                    for row in expired_rows
+                ),
+            )
+            return len(expired_rows)
 
     @staticmethod
     def _execute_save_job(connection: sqlite3.Connection, record: JobRecord) -> None:
@@ -658,6 +771,63 @@ class SQLiteFillActorRepository:
         return tuple(
             _job_from_row(row) for row in rows if selected_states is None or JobState(row['state']) in selected_states
         )
+
+    def _list_job_feeds(self, job_id: str) -> tuple[JobFeedRecord, ...]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                'SELECT * FROM job_feeds WHERE job_id = ? ORDER BY actor_id',
+                (job_id,),
+            ).fetchall()
+        return tuple(_job_feed_from_row(row) for row in rows)
+
+    def _update_owned_job_feed(  # noqa: PLR0913
+        self,
+        job_id: str,
+        actor_id: str,
+        owner_id: str,
+        state: JobFeedState,
+        attempts: int,
+        error_code: JobFeedErrorCode | None,
+        now: datetime,
+    ) -> bool:
+        record = JobFeedRecord(
+            job_id=job_id,
+            actor_id=actor_id,
+            state=state,
+            attempts=attempts,
+            updated_at=now,
+            error_code=error_code,
+        )
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                """
+                UPDATE job_feeds SET
+                    state = ?, attempts = ?, updated_at = ?, error_code = ?
+                WHERE job_id = ? AND actor_id = ?
+                  AND state IN ('queued', 'warming')
+                  AND attempts <= ?
+                  AND EXISTS (
+                      SELECT 1 FROM jobs
+                      WHERE jobs.job_id = job_feeds.job_id
+                        AND jobs.owner_id = ?
+                        AND jobs.state = 'running'
+                        AND jobs.lease_expires_at IS NOT NULL
+                        AND jobs.lease_expires_at > ?
+                  )
+                """,
+                (
+                    record.state.value,
+                    record.attempts,
+                    _datetime_to_text(record.updated_at),
+                    record.error_code,
+                    record.job_id,
+                    record.actor_id,
+                    record.attempts,
+                    owner_id,
+                    _datetime_to_text(now),
+                ),
+            )
+            return cursor.rowcount == 1
 
     def _save_move_journal(self, record: MoveJournalRecord) -> None:
         with closing(self._connect()) as connection, connection:
@@ -766,6 +936,18 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
         lease_expires_at=datetime.fromisoformat(row['lease_expires_at']) if row['lease_expires_at'] else None,
         actor_ids=tuple(json.loads(row['actor_ids_json'])),
         progress=_progress_from_row(row),
+    )
+
+
+def _job_feed_from_row(row: sqlite3.Row) -> JobFeedRecord:
+    return JobFeedRecord(
+        job_id=row['job_id'],
+        actor_id=row['actor_id'],
+        state=JobFeedState(row['state']),
+        attempts=row['attempts'],
+        updated_at=datetime.fromisoformat(row['updated_at']),
+        error_code=JobFeedErrorCode(row['error_code']) if row['error_code'] else None,
+        freshrss_add_url=row['freshrss_add_url'],
     )
 
 
