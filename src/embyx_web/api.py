@@ -21,6 +21,8 @@ from embyx_web.fill_actor.errors import (
     FillActorError,
     InvalidActorIdError,
     JobQueueFullError,
+    LegacyPlanError,
+    MoveDisabledError,
     RevisionMismatchError,
     TooManyActorsError,
     TooManyVideosError,
@@ -234,14 +236,14 @@ def create_app(  # noqa: C901, PLR0913, PLR0915
         if not await repository.health_check():
             msg = 'fill-actor repository is unavailable'
             raise RuntimeError(msg)
-        if await service.roots_ready():
+        if await service.apply_ready():
             await service.reconcile_moves()
         await jobs.start()
 
         async def maintain() -> None:
             while True:
                 try:
-                    if await service.roots_ready():
+                    if await service.apply_ready():
                         await service.reconcile_moves()
                     await repository.purge_expired_plans(datetime.now(UTC))
                 except asyncio.CancelledError:
@@ -288,8 +290,12 @@ def create_app(  # noqa: C901, PLR0913, PLR0915
         ):
             raise ApiError(401, 'unauthorized')
 
-    async def require_ready() -> None:
-        if not await repository.health_check() or not await service.roots_ready():
+    async def require_scan_ready() -> None:
+        if not await repository.health_check() or not await service.scan_ready():
+            raise ApiError(503, 'not_ready')
+
+    async def require_apply_ready() -> None:
+        if not await repository.health_check() or not await service.apply_ready():
             raise ApiError(503, 'not_ready')
 
     async def require_repository_ready() -> None:
@@ -315,7 +321,7 @@ def create_app(  # noqa: C901, PLR0913, PLR0915
     @app.post(
         '/api/fill-actor/plans',
         status_code=202,
-        dependencies=[Depends(require_mutation_auth), Depends(require_ready)],
+        dependencies=[Depends(require_mutation_auth), Depends(require_scan_ready)],
     )
     async def create_plan(request: CreatePlanRequest) -> PlanEnvelope:
         job = await jobs.start_plan(request.actor_ids)
@@ -383,7 +389,7 @@ def create_app(  # noqa: C901, PLR0913, PLR0915
 
     @app.post(
         '/api/fill-actor/plans/{plan_id}/apply',
-        dependencies=[Depends(require_mutation_auth), Depends(require_ready)],
+        dependencies=[Depends(require_mutation_auth), Depends(require_apply_ready)],
     )
     async def apply_plan(plan_id: str, request: ApplyPlanRequest) -> ApplyResult:
         job = await jobs.get_job(plan_id)
@@ -401,12 +407,19 @@ def create_app(  # noqa: C901, PLR0913, PLR0915
     async def health() -> JSONResponse:
         database_ready = await repository.health_check()
         roots_ready = await service.roots_ready()
-        ready = database_ready and roots_ready
+        cloud_ready = await service.cloud_ready()
+        legacy_journal_ready = await service.legacy_journal_ready()
+        ready = database_ready and roots_ready and cloud_ready
+        apply_ready = service.apply_enabled and ready and legacy_journal_ready
         return JSONResponse(
             {
                 'status': 'ok' if ready else 'not_ready',
                 'database': database_ready,
                 'roots': roots_ready,
+                'cloud': cloud_ready,
+                'legacy_journal': legacy_journal_ready,
+                'apply_enabled': service.apply_enabled,
+                'apply_ready': apply_ready,
             },
             status_code=200 if ready else 503,
         )
@@ -421,6 +434,8 @@ def _service_error_status(exc: FillActorError) -> int:
         (InvalidActorIdError, 422),
         (TooManyActorsError, 422),
         (TooManyVideosError, 422),
+        (MoveDisabledError, 503),
+        (LegacyPlanError, 409),
         (UnknownPlanError, 404),
         (ExpiredPlanError, 410),
         (RevisionMismatchError, 409),

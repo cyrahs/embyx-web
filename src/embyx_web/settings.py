@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
+from embyx_web.fill_actor.cloud_moves import CloudMovePaths
+
 
 def _optional_path(value: str | None) -> Path | None:
     return Path(value).expanduser() if value else None
@@ -77,6 +79,8 @@ class Settings:
     magnet_concurrency: int = 8
     root_sentinel: str = '.embyx-root'
     move_in_by_brand: bool = False
+    apply_enabled: bool = False
+    cloud_move_paths: CloudMovePaths | None = None
     rsshub_url: str | None = None
     freshrss_url: str | None = None
     freshrss_rsshub_url: str | None = None
@@ -90,6 +94,38 @@ class Settings:
             for value in os.environ.get('EMBYX_WEB_ADDITIONAL_ROOTS', '').split(os.pathsep)
             if value
         )
+        cloud_source_roots = tuple(
+            value for value in os.environ.get('EMBYX_WEB_CLOUD_SOURCE_ROOTS', '').split(os.pathsep) if value
+        )
+        cloud_strm_mount_prefix = os.environ.get('EMBYX_WEB_CLOUD_STRM_MOUNT_PREFIX') or None
+        cloud_move_in_root = os.environ.get('EMBYX_WEB_CLOUD_MOVE_IN_ROOT') or None
+        cloud_values_configured = (
+            cloud_strm_mount_prefix is not None,
+            bool(cloud_source_roots),
+            cloud_move_in_root is not None,
+        )
+        if any(cloud_values_configured) and not all(cloud_values_configured):
+            msg = (
+                'EMBYX_WEB_CLOUD_STRM_MOUNT_PREFIX, EMBYX_WEB_CLOUD_SOURCE_ROOTS, '
+                'and EMBYX_WEB_CLOUD_MOVE_IN_ROOT must be configured together'
+            )
+            raise ValueError(msg)
+        cloud_move_paths = (
+            CloudMovePaths.from_values(
+                strm_mount_prefix=cloud_strm_mount_prefix,
+                source_api_roots=cloud_source_roots,
+                move_in_api_root=cloud_move_in_root,
+            )
+            if cloud_strm_mount_prefix is not None and cloud_move_in_root is not None
+            else None
+        )
+        if cloud_move_paths is not None and len(cloud_move_paths.source_api_roots) != len(additional):
+            msg = 'EMBYX_WEB_CLOUD_SOURCE_ROOTS must match EMBYX_WEB_ADDITIONAL_ROOTS one-for-one'
+            raise ValueError(msg)
+        apply_enabled = _boolean('EMBYX_WEB_APPLY_ENABLED')
+        if apply_enabled and cloud_move_paths is None:
+            msg = 'EMBYX_WEB_APPLY_ENABLED requires the CloudDrive move path configuration'
+            raise ValueError(msg)
         settings = cls(
             database_path=database_path,
             mutation_lock_path=Path(os.environ.get('EMBYX_WEB_MUTATION_LOCK_PATH', lock_default)).expanduser(),
@@ -111,6 +147,8 @@ class Settings:
             magnet_concurrency=_positive_int('EMBYX_WEB_MAGNET_CONCURRENCY', 8),
             root_sentinel=os.environ.get('EMBYX_WEB_ROOT_SENTINEL', '.embyx-root'),
             move_in_by_brand=_boolean('EMBYX_WEB_MOVE_IN_BY_BRAND'),
+            apply_enabled=apply_enabled,
+            cloud_move_paths=cloud_move_paths,
             rsshub_url=_optional_http_base_url(
                 'EMBYX_WEB_RSSHUB_URL',
                 os.environ.get('EMBYX_WEB_RSSHUB_URL'),

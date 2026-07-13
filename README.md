@@ -6,13 +6,15 @@ and a packaged React management page while keeping filesystem mutation independe
 ## Implemented
 
 - Framework-independent `FillActorService` with explicit scan/plan/apply boundaries.
-- SQLite and in-memory repositories for plans, private candidates, results, durable jobs, leases, and move journals.
+- SQLite and in-memory repositories for plans, private candidates, results, durable jobs, leases, and local/CloudDrive
+  move journals.
 - Explicit SQLite migrations, WAL mode, write-readiness probes, cancellation-safe operations, and restart recovery.
 - A bounded persisted scan queue with atomic claim/lease/heartbeat fencing across processes and durable, idempotent
   cancellation of queued or running scans.
-- Linux atomic no-overwrite moves using `renameat2(RENAME_NOREPLACE)`, with a same-filesystem hard-link/quarantine
-  fallback for NFS servers that reject rename flags, plus a cross-process advisory lock.
-- Recovery for current atomic moves and legacy `prepared`, `linked`, and `source_removed` journal states.
+- Strict `.strm` parsing that maps a configured mount namespace to CloudDrive API-native paths, snapshots remote file
+  identity, and moves only the referenced video through CloudDrive with conflict policy `Skip`.
+- Observation-only recovery for ambiguous CloudDrive timeouts and restarts. Legacy local journal records are never
+  replayed in CloudDrive mode; they keep apply unavailable until an operator resolves or migrates them.
 - FastAPI endpoints with stable JSON error codes, request/actor/video limits, readiness checks, and Bearer auth for writes.
 - React + TypeScript + Vite UI with polling, in-progress scan cancellation, grouped results, move confirmation,
   conflicts, partial failures, one-click bulk magnet copying, RSSHub cache readiness, FreshRSS hand-off, and
@@ -22,27 +24,24 @@ and a packaged React management page while keeping filesystem mutation independe
 - Static frontend assets included in the Python wheel.
 - A lazy, origin-checked adapter boundary for a narrow `embyx` compatibility API; tests never load legacy secrets.
 
-## Filesystem safety and recovery
+## CloudDrive safety and recovery
 
-Public plans contain only opaque IDs and display-safe filenames. Absolute source, root, and destination paths remain in
-private repository records. Applying a candidate follows this sequence:
+Public plans contain only opaque IDs and display-safe filenames. Mapping paths, CloudDrive API paths, identities, and
+operation state remain in private SQLite records. In CloudDrive mode, applying a candidate follows this sequence:
 
-1. Validate plan revision, expiry, candidate membership, configured root sentinels, device identity, and source
-   fingerprint.
-2. Persist a `prepared` journal entry and acquire the cross-process mutation lock.
-3. Atomically rename source to destination with `RENAME_NOREPLACE`. If the mounted filesystem rejects that flag, create
-   the destination with an atomic no-overwrite hard link and move the source through a private recovery quarantine.
-4. Verify inode/fingerprint identity, remove only the verified source link, persist the result, and advance the journal
-   through its compatibility states to `reconciled`.
+1. Revalidate plan revision, expiry, mapping-root identity, the `.strm` inode/content digest, its configured source root,
+   and the planned CloudDrive file ID, size, write time, and hashes.
+2. Idempotently ensure one target brand directory directly below the configured move-in root, then require its target
+   filename to be absent.
+3. Persist `prepared` and then `submitting` before invoking one `MoveFile` call with conflict policy `Skip`.
+4. Force-refresh both remote parents and record success only when the source is absent and the destination has the
+   planned identity.
 
-If a process stops after the rename but before persistence, startup reconciliation compares both paths with the recorded
-fingerprint. Ambiguous replacements and failed quarantine/rollback operations remain unreconciled for a later retry;
-plans with such journals cannot be purged or explicitly deleted. Cancelling an apply request waits for native
-filesystem and SQLite operations to finish before releasing locks or propagating cancellation.
-
-The move source and move-in destination must be on the same filesystem. The host must be Linux. The filesystem must
-support either `renameat2(RENAME_NOREPLACE)` or hard links; a target that supports neither is reported as
-`move_unsupported` and is left unchanged.
+Timeouts, disconnects, and process exits after submission become `unknown`. Reconciliation only observes the two remote
+paths; it never blindly submits another move. An unresolved source is unique across plans and prevents duplicate
+operations. The derived `.strm` is never renamed, linked, deleted, or used as the CloudDrive API source. Legacy local
+move code remains only for compatibility tests and old databases; environment-based production bootstrap refuses to
+enable apply unless the CloudDrive path mapping is complete.
 
 ## Backend configuration
 
@@ -60,6 +59,10 @@ The production bootstrap reads only explicit `EMBYX_WEB_*` variables:
 | `EMBYX_WEB_ADDITIONAL_ROOTS` | Additional roots separated by the OS path separator | required |
 | `EMBYX_WEB_MOVE_IN_ROOT` | Move-in destination root | required |
 | `EMBYX_WEB_MOVE_IN_BY_BRAND` | Put moved files under `<move-in>/<resolved-brand>/` | `false` |
+| `EMBYX_WEB_APPLY_ENABLED` | Allow apply and move-journal reconciliation | `false` |
+| `EMBYX_WEB_CLOUD_STRM_MOUNT_PREFIX` | Prefix present inside `.strm` targets and stripped before CloudDrive calls | disabled |
+| `EMBYX_WEB_CLOUD_SOURCE_ROOTS` | API-native source roots, one-for-one with additional roots | disabled |
+| `EMBYX_WEB_CLOUD_MOVE_IN_ROOT` | API-native destination root; brand is appended | disabled |
 | `EMBYX_WEB_ROOT_SENTINEL` | Required regular marker file in every configured root | `.embyx-root` |
 | `EMBYX_WEB_RUNTIME_ROOT` | Root containing the compatibility package | required |
 | `EMBYX_WEB_RUNTIME_MODULE` | Compatibility module name | `src.embyx_runtime.fill_actor_api` |
@@ -76,6 +79,14 @@ The production bootstrap reads only explicit `EMBYX_WEB_*` variables:
 Create the sentinel deliberately in the actual mounted filesystem of the actor root, every additional root, and the
 move-in root. A missing marker makes readiness fail and prevents scanning/reconciliation, protecting against an empty
 mount point being mistaken for the real library.
+
+Apply and all reconciliation are disabled by default. Enabling it requires all three CloudDrive path variables and a
+runtime adapter configured with `EMBYX_RUNTIME_CLOUDDRIVE_ADDRESS`, `EMBYX_RUNTIME_CLOUDDRIVE_API_TOKEN`, and
+`EMBYX_RUNTIME_CLOUDDRIVE_SECURE`. Inject the token from a Secret; never commit it or bake it into this public image.
+The token needs only list, view-properties, create-folder, and move permissions rooted high enough to cover the
+configured sources and destination. The switch does not affect scans, magnet lookup, RSSHub prewarming, or FreshRSS
+actions. CloudDrive connectivity remains part of scan readiness when CloudDrive mode is configured; unresolved legacy
+local journals affect only apply readiness.
 
 Binding to a non-loopback address is rejected unless both `EMBYX_WEB_API_TOKEN` and
 `EMBYX_WEB_TLS_TERMINATED=true` are set. The flag is an operator assertion: this app does not terminate TLS itself, so
@@ -96,6 +107,9 @@ module located under `EMBYX_WEB_RUNTIME_ROOT` and expose:
 async def list_actor_video_ids(actor_id: str) -> tuple[str, ...]: ...
 def resolve_brand(video_id: str) -> str | None: ...
 async def find_sukebei_magnet(video_id: str) -> str | None: ...
+async def list_cloud_directory(api_dir: str) -> tuple[dict[str, object], ...]: ...
+async def ensure_cloud_directory(parent_api_dir: str, folder_name: str) -> dict[str, object]: ...
+async def move_cloud_file(source_api_path: str, destination_api_dir: str) -> dict[str, object]: ...
 async def aclose() -> None: ...
 ```
 
@@ -186,16 +200,16 @@ Container defaults are:
 - runtime module: `src.embyx_runtime.fill_actor_api`;
 - entrypoint: `/app/.venv/bin/python -m embyx_web`.
 
-Mount a persistent volume at `/var/lib/embyx-web` and mount the `media-embyx` PVC at the same paths referenced by
+Mount a persistent volume at `/var/lib/embyx-web` and mount the `media-embyx` PVC read-only at the paths referenced by
 `EMBYX_WEB_ACTOR_ROOT`, `EMBYX_WEB_ADDITIONAL_ROOTS`, and `EMBYX_WEB_MOVE_IN_ROOT`. The compatibility API does not need
-the legacy `config.toml`; its optional magnet log directory is controlled only by `EMBYX_RUNTIME_LOG_DIR`. The image
+the legacy `config.toml`; CloudDrive connection values are injected explicitly at runtime, and its optional magnet log
+directory is controlled only by `EMBYX_RUNTIME_LOG_DIR`. The image
 keeps the safe loopback bind default; a Kubernetes Deployment normally sets `EMBYX_WEB_HOST=0.0.0.0` together with a
 Bearer token and `EMBYX_WEB_TLS_TERMINATED=true` behind a TLS-terminating proxy.
 
-For the migrated production library, the GitOps deployment mounts `media-embyx` at `/root/data/embyx`, scans the
-category roots under `/root/data/embyx/remote`, and moves matches into
-`/root/data/embyx/remote/actor/clt/<brand>/` with `EMBYX_WEB_MOVE_IN_BY_BRAND=true`. The old CloudDrive paths are not
-mounted into this service. Each configured category root must contain its deliberately created `.embyx-root` marker.
+Production mount paths, CloudDrive namespaces, service addresses, and browser-facing URLs belong in deployment env or
+Secrets, not this public repository. The mapping PVC stays read-only, CloudDrive storage is not mounted into this
+service, and every configured mapping root must contain its deliberately created sentinel marker.
 
 The container smoke check verifies that the installed web package comes from `/opt/embyx-web`, legacy `src` and `tap`
 remain discoverable from `/app`, the compatibility module passes the origin-checked loader, static assets ship in the

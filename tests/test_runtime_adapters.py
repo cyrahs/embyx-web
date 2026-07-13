@@ -79,6 +79,44 @@ async def aclose():
     assert events == [(0, 2, None), (1, 2, 1), (2, 2, 2)]
 
 
+@pytest.mark.asyncio
+async def test_runtime_cloud_adapter_normalizes_builtin_metadata_and_move_response(tmp_path: Path) -> None:
+    package = tmp_path / 'cloud_runtime'
+    package.mkdir()
+    (package / '__init__.py').write_text('', encoding='utf-8')
+    (package / 'fill_actor_api.py').write_text(
+        """
+async def list_actor_video_ids(_actor_id): return ()
+def resolve_brand(_video_id): return 'ABC'
+async def find_sukebei_magnet(_video_id): return None
+async def list_cloud_directory(_path):
+    return (
+        {'id': 'dir', 'name': 'nested', 'full_path': '/115/nested', 'size': 0,
+         'is_directory': True, 'write_time': {'seconds': 1, 'nanos': 2}, 'hashes': {}},
+        {'id': 'file', 'name': 'ABC-001.mp4', 'full_path': '/115/ABC-001.mp4', 'size': 3,
+         'is_directory': False, 'write_time': {'seconds': 4, 'nanos': 5}, 'hashes': {'1': 'hash'}},
+    )
+async def ensure_cloud_directory(_parent, _name):
+    return {'success': True, 'created': True, 'path': '/cloud/dst/ABC'}
+async def move_cloud_file(_source, _destination):
+    return {'success': True, 'error_message': '', 'result_file_paths': ('/115/dst/ABC-001.mp4',)}
+async def aclose(): return None
+""",
+        encoding='utf-8',
+    )
+
+    adapters = load_runtime_adapters(runtime_root=tmp_path, module_name='cloud_runtime.fill_actor_api')
+
+    assert adapters.cloud_file_mover is not None
+    listing = await adapters.cloud_file_mover.list_directory('/115')
+    assert len(listing) == 1
+    assert listing[0].path == '/115/ABC-001.mp4'
+    assert listing[0].write_time == 4_000_000_005
+    response = await adapters.cloud_file_mover.move_file('/115/ABC-001.mp4', '/115/dst')
+    assert response.success is True
+    assert response.result_paths == ('/115/dst/ABC-001.mp4',)
+
+
 def test_rejects_runtime_module_loaded_outside_configured_root(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match='outside'):
         load_runtime_adapters(runtime_root=tmp_path, module_name='embyx_web.fill_actor.models')

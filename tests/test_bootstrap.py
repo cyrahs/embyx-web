@@ -51,7 +51,9 @@ async def aclose():
     )
 
     with TestClient(build_app(settings)) as client:
-        assert client.get('/api/health').json()['status'] == 'ok'
+        health = client.get('/api/health').json()
+        assert health['status'] == 'ok'
+        assert health['apply_enabled'] is False
         response = client.post('/api/fill-actor/plans', json={'actor_ids': ['actor']})
         assert response.status_code == 202
 
@@ -101,6 +103,7 @@ def test_bootstrap_passes_feed_integration_urls_to_warmer_and_api(monkeypatch, t
         rsshub_url='http://rsshub.internal.test',
         freshrss_url='https://freshrss.example.test',
         freshrss_rsshub_url='https://rsshub.example.test',
+        apply_enabled=True,
     )
 
     assert build_app(settings) is app
@@ -108,6 +111,7 @@ def test_bootstrap_passes_feed_integration_urls_to_warmer_and_api(monkeypatch, t
     assert captured['warmer']['freshrss_url'] == settings.freshrss_url
     assert captured['warmer']['freshrss_rsshub_url'] == settings.freshrss_rsshub_url
     assert captured['jobs']['feed_warmer'] is warmer
+    assert captured['jobs']['service'].apply_enabled is True
     assert captured['api']['jobs'] is jobs
     assert captured['api']['freshrss_url'] == settings.freshrss_url
     assert captured['api']['freshrss_rsshub_url'] == settings.freshrss_rsshub_url

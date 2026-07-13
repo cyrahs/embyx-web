@@ -6,12 +6,16 @@ from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
+from embyx_web.fill_actor.cloud_moves import CloudFileMetadata
 from embyx_web.fill_actor.models import FillActorPlan, MoveResult
 from embyx_web.fill_actor.persistence import (
     JOB_CANCELLED_ERROR_CODE,
     CancelJobOutcome,
     CancelJobResult,
+    CandidateKind,
     CandidateRecord,
+    CloudMoveOperationRecord,
+    CloudMoveOperationState,
     FileFingerprint,
     JobFeedErrorCode,
     JobFeedRecord,
@@ -26,10 +30,11 @@ from embyx_web.fill_actor.persistence import (
     MoveJournalState,
     PlanRecord,
     normalize_datetime,
+    validate_cloud_move_transition,
     validate_journal_transition,
 )
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 
 async def _run_sync[ResultT](function: Callable[..., ResultT], *args: object) -> ResultT:
@@ -178,6 +183,41 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
         """,
         'CREATE INDEX job_feeds_state_idx ON job_feeds (state, updated_at)',
     ),
+    5: (
+        "ALTER TABLE candidates ADD COLUMN candidate_kind TEXT NOT NULL DEFAULT 'local_file' "
+        "CHECK (candidate_kind IN ('local_file', 'cloud_strm'))",
+        'ALTER TABLE candidates ADD COLUMN mapping_sha256 TEXT',
+        'ALTER TABLE candidates ADD COLUMN cloud_source_path TEXT',
+        'ALTER TABLE candidates ADD COLUMN cloud_destination_dir TEXT',
+        'ALTER TABLE candidates ADD COLUMN cloud_file_json TEXT',
+        """
+        CREATE TABLE cloud_move_operations (
+            plan_id TEXT NOT NULL,
+            candidate_id TEXT NOT NULL,
+            attempt_id TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            destination_dir TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN (
+                'prepared', 'submitting', 'verifying', 'unknown', 'succeeded', 'conflict', 'failed'
+            )),
+            updated_at TEXT NOT NULL,
+            error_code TEXT,
+            CHECK (
+                (state IN ('unknown', 'conflict', 'failed') AND error_code IS NOT NULL)
+                OR (state NOT IN ('unknown', 'conflict', 'failed') AND error_code IS NULL)
+            ),
+            PRIMARY KEY (plan_id, candidate_id),
+            FOREIGN KEY (plan_id, candidate_id)
+                REFERENCES candidates (plan_id, candidate_id) ON DELETE CASCADE
+        )
+        """,
+        'CREATE INDEX cloud_move_operations_state_idx ON cloud_move_operations (state, updated_at)',
+        """
+        CREATE UNIQUE INDEX cloud_move_operations_active_source_idx
+        ON cloud_move_operations (source_path)
+        WHERE state IN ('prepared', 'submitting', 'verifying', 'unknown')
+        """,
+    ),
 }
 
 
@@ -310,6 +350,25 @@ class SQLiteFillActorRepository:
     async def list_unreconciled_moves(self) -> tuple[MoveJournalRecord, ...]:
         return await _run_sync(self._list_unreconciled_moves)
 
+    async def save_cloud_move_operation(self, record: CloudMoveOperationRecord) -> None:
+        if record.state.terminal:
+            msg = 'terminal CloudDrive operations must be finalized with their result'
+            raise ValueError(msg)
+        await _run_sync(self._save_cloud_move_operation, record)
+
+    async def get_cloud_move_operation(
+        self,
+        plan_id: str,
+        candidate_id: str,
+    ) -> CloudMoveOperationRecord | None:
+        return await _run_sync(self._get_cloud_move_operation, plan_id, candidate_id)
+
+    async def list_unresolved_cloud_moves(self) -> tuple[CloudMoveOperationRecord, ...]:
+        return await _run_sync(self._list_unresolved_cloud_moves)
+
+    async def finalize_cloud_move(self, operation: CloudMoveOperationRecord, result: MoveResult) -> None:
+        await _run_sync(self._finalize_cloud_move, operation, result)
+
     async def health_check(self) -> bool:
         return await _run_sync(self._health_check)
 
@@ -389,9 +448,10 @@ class SQLiteFillActorRepository:
                     INSERT INTO candidates (
                         plan_id, candidate_id, video_id, source_path, source_root, destination_path,
                         fingerprint_device, fingerprint_inode, fingerprint_size,
-                        fingerprint_mtime_ns, fingerprint_ctime_ns
+                        fingerprint_mtime_ns, fingerprint_ctime_ns, candidate_kind,
+                        mapping_sha256, cloud_source_path, cloud_destination_dir, cloud_file_json
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT (plan_id, candidate_id) DO UPDATE SET
                         video_id = excluded.video_id,
                         source_path = excluded.source_path,
@@ -401,7 +461,12 @@ class SQLiteFillActorRepository:
                         fingerprint_inode = excluded.fingerprint_inode,
                         fingerprint_size = excluded.fingerprint_size,
                         fingerprint_mtime_ns = excluded.fingerprint_mtime_ns,
-                        fingerprint_ctime_ns = excluded.fingerprint_ctime_ns
+                        fingerprint_ctime_ns = excluded.fingerprint_ctime_ns,
+                        candidate_kind = excluded.candidate_kind,
+                        mapping_sha256 = excluded.mapping_sha256,
+                        cloud_source_path = excluded.cloud_source_path,
+                        cloud_destination_dir = excluded.cloud_destination_dir,
+                        cloud_file_json = excluded.cloud_file_json
                     """,
                     (
                         public.plan_id,
@@ -415,6 +480,11 @@ class SQLiteFillActorRepository:
                         fingerprint.size,
                         fingerprint.mtime_ns,
                         fingerprint.ctime_ns,
+                        candidate.kind.value,
+                        candidate.mapping_sha256,
+                        candidate.cloud_source_path,
+                        candidate.cloud_destination_dir,
+                        _cloud_file_to_json(candidate.cloud_file),
                     ),
                 )
 
@@ -448,7 +518,15 @@ class SQLiteFillActorRepository:
                 "SELECT 1 FROM move_journal WHERE plan_id = ? AND state != 'reconciled' LIMIT 1",
                 (plan_id,),
             ).fetchone()
-            if unreconciled is not None:
+            unresolved_cloud = connection.execute(
+                """
+                SELECT 1 FROM cloud_move_operations
+                WHERE plan_id = ? AND state NOT IN ('succeeded', 'conflict', 'failed')
+                LIMIT 1
+                """,
+                (plan_id,),
+            ).fetchone()
+            if unreconciled is not None or unresolved_cloud is not None:
                 return False
             connection.execute('UPDATE jobs SET plan_id = NULL WHERE plan_id = ?', (plan_id,))
             cursor = connection.execute('DELETE FROM plans WHERE plan_id = ?', (plan_id,))
@@ -465,6 +543,11 @@ class SQLiteFillActorRepository:
                       SELECT 1 FROM move_journal
                       WHERE move_journal.plan_id = plans.plan_id
                         AND move_journal.state != 'reconciled'
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM cloud_move_operations
+                      WHERE cloud_move_operations.plan_id = plans.plan_id
+                        AND cloud_move_operations.state NOT IN ('succeeded', 'conflict', 'failed')
                   )
                 """,
                 (_datetime_to_text(now),),
@@ -946,6 +1029,122 @@ class SQLiteFillActorRepository:
             ).fetchall()
         return tuple(_journal_from_row(row) for row in rows)
 
+    def _save_cloud_move_operation(self, record: CloudMoveOperationRecord) -> None:
+        with closing(self._connect()) as connection, connection:
+            connection.execute('BEGIN IMMEDIATE')
+            self._execute_save_cloud_move_operation(connection, record)
+
+    def _execute_save_cloud_move_operation(
+        self,
+        connection: sqlite3.Connection,
+        record: CloudMoveOperationRecord,
+    ) -> None:
+        candidate = connection.execute(
+            """
+            SELECT candidate_kind, cloud_source_path, cloud_destination_dir
+            FROM candidates WHERE plan_id = ? AND candidate_id = ?
+            """,
+            (record.plan_id, record.candidate_id),
+        ).fetchone()
+        if candidate is None:
+            raise KeyError((record.plan_id, record.candidate_id))
+        if candidate['candidate_kind'] != CandidateKind.CLOUD_STRM.value:
+            msg = 'CloudDrive operations require a CloudDrive candidate'
+            raise ValueError(msg)
+        if (
+            candidate['cloud_source_path'] != record.source_path
+            or candidate['cloud_destination_dir'] != record.destination_dir
+        ):
+            msg = 'CloudDrive operation paths must match its candidate'
+            raise ValueError(msg)
+        current_row = connection.execute(
+            'SELECT state, attempt_id FROM cloud_move_operations WHERE plan_id = ? AND candidate_id = ?',
+            (record.plan_id, record.candidate_id),
+        ).fetchone()
+        current = CloudMoveOperationState(current_row['state']) if current_row is not None else None
+        validate_cloud_move_transition(current, record.state)
+        if current_row is not None and current_row['attempt_id'] != record.attempt_id:
+            msg = 'CloudDrive operation attempt id cannot change'
+            raise ValueError(msg)
+        try:
+            connection.execute(
+                """
+                INSERT INTO cloud_move_operations (
+                    plan_id, candidate_id, attempt_id, source_path, destination_dir,
+                    state, updated_at, error_code
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (plan_id, candidate_id) DO UPDATE SET
+                    state = excluded.state,
+                    updated_at = excluded.updated_at,
+                    error_code = excluded.error_code
+                """,
+                (
+                    record.plan_id,
+                    record.candidate_id,
+                    record.attempt_id,
+                    record.source_path,
+                    record.destination_dir,
+                    record.state.value,
+                    _datetime_to_text(record.updated_at),
+                    record.error_code,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            msg = 'CloudDrive source already has an unresolved operation'
+            raise ValueError(msg) from exc
+
+    def _get_cloud_move_operation(
+        self,
+        plan_id: str,
+        candidate_id: str,
+    ) -> CloudMoveOperationRecord | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                'SELECT * FROM cloud_move_operations WHERE plan_id = ? AND candidate_id = ?',
+                (plan_id, candidate_id),
+            ).fetchone()
+        return _cloud_move_operation_from_row(row) if row is not None else None
+
+    def _list_unresolved_cloud_moves(self) -> tuple[CloudMoveOperationRecord, ...]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM cloud_move_operations
+                WHERE state NOT IN ('succeeded', 'conflict', 'failed')
+                ORDER BY updated_at, plan_id, candidate_id
+                """
+            ).fetchall()
+        return tuple(_cloud_move_operation_from_row(row) for row in rows)
+
+    def _finalize_cloud_move(self, operation: CloudMoveOperationRecord, result: MoveResult) -> None:
+        if not operation.state.terminal:
+            msg = 'finalized CloudDrive operation must be terminal'
+            raise ValueError(msg)
+        if operation.candidate_id != result.candidate_id:
+            msg = 'CloudDrive result must match its operation'
+            raise ValueError(msg)
+        with closing(self._connect()) as connection, connection:
+            connection.execute('BEGIN IMMEDIATE')
+            self._execute_save_cloud_move_operation(connection, operation)
+            row = connection.execute(
+                'SELECT video_id FROM candidates WHERE plan_id = ? AND candidate_id = ?',
+                (operation.plan_id, operation.candidate_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError((operation.plan_id, operation.candidate_id))
+            if row['video_id'] != result.video_id:
+                msg = 'move result video id does not match candidate'
+                raise ValueError(msg)
+            connection.execute(
+                """
+                INSERT INTO move_results (plan_id, candidate_id, result_json)
+                VALUES (?, ?, ?)
+                ON CONFLICT (plan_id, candidate_id) DO UPDATE SET result_json = excluded.result_json
+                """,
+                (operation.plan_id, operation.candidate_id, result.model_dump_json()),
+            )
+
     def _health_check(self) -> bool:
         try:
             with closing(self._connect()) as connection:
@@ -965,6 +1164,7 @@ class SQLiteFillActorRepository:
 
 
 def _candidate_from_row(row: sqlite3.Row) -> CandidateRecord:
+    cloud_file_json = row['cloud_file_json']
     return CandidateRecord(
         candidate_id=row['candidate_id'],
         video_id=row['video_id'],
@@ -978,6 +1178,11 @@ def _candidate_from_row(row: sqlite3.Row) -> CandidateRecord:
             mtime_ns=row['fingerprint_mtime_ns'],
             ctime_ns=row['fingerprint_ctime_ns'],
         ),
+        kind=CandidateKind(row['candidate_kind']),
+        mapping_sha256=row['mapping_sha256'],
+        cloud_source_path=row['cloud_source_path'],
+        cloud_destination_dir=row['cloud_destination_dir'],
+        cloud_file=_cloud_file_from_json(cloud_file_json) if cloud_file_json is not None else None,
     )
 
 
@@ -988,6 +1193,44 @@ def _journal_from_row(row: sqlite3.Row) -> MoveJournalRecord:
         state=MoveJournalState(row['state']),
         updated_at=datetime.fromisoformat(row['updated_at']),
     )
+
+
+def _cloud_move_operation_from_row(row: sqlite3.Row) -> CloudMoveOperationRecord:
+    return CloudMoveOperationRecord(
+        plan_id=row['plan_id'],
+        candidate_id=row['candidate_id'],
+        attempt_id=row['attempt_id'],
+        source_path=row['source_path'],
+        destination_dir=row['destination_dir'],
+        state=CloudMoveOperationState(row['state']),
+        updated_at=datetime.fromisoformat(row['updated_at']),
+        error_code=row['error_code'],
+    )
+
+
+def _cloud_file_to_json(value: CloudFileMetadata | None) -> str | None:
+    if value is None:
+        return None
+    return json.dumps(
+        {
+            'path': value.path,
+            'id': value.file_id,
+            'name': value.name,
+            'size': value.size,
+            'write_time': value.write_time,
+            'hashes': dict(value.hashes),
+        },
+        separators=(',', ':'),
+        sort_keys=True,
+    )
+
+
+def _cloud_file_from_json(value: str) -> CloudFileMetadata:
+    decoded = json.loads(value)
+    if not isinstance(decoded, dict):
+        msg = 'invalid stored CloudDrive metadata'
+        raise TypeError(msg)
+    return CloudFileMetadata.from_mapping(decoded)
 
 
 def _job_from_row(row: sqlite3.Row) -> JobRecord:

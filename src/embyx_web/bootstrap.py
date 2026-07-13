@@ -22,6 +22,9 @@ def build_app(settings: Settings) -> FastAPI:
         runtime_root=settings.embyx_runtime_path,
         module_name=settings.embyx_runtime_module,
     )
+    if settings.cloud_move_paths is not None and runtime.cloud_file_mover is None:
+        msg = 'configured embyx runtime does not provide the CloudDrive compatibility API'
+        raise RuntimeError(msg)
     repository = SQLiteFillActorRepository(settings.database_path)
     service = FillActorService(
         paths=FillActorPaths.from_iterable(
@@ -37,6 +40,9 @@ def build_app(settings: Settings) -> FastAPI:
         magnet_concurrency=settings.magnet_concurrency,
         root_sentinel=settings.root_sentinel,
         move_in_by_brand=settings.move_in_by_brand,
+        apply_enabled=settings.apply_enabled,
+        cloud_file_mover=runtime.cloud_file_mover if settings.cloud_move_paths is not None else None,
+        cloud_move_paths=settings.cloud_move_paths,
         repository=repository,
         mutation_lock=AsyncFileLock(settings.mutation_lock_path),
     )

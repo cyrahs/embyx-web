@@ -56,7 +56,7 @@ function requestHeaders(): HeadersInit {
   }
 }
 
-async function request(path: string, init?: RequestInit): Promise<unknown> {
+async function request(path: string, init?: RequestInit, acceptedStatuses: readonly number[] = []): Promise<unknown> {
   let response: Response
   try {
     response = await fetch(path, { ...init, headers: { ...requestHeaders(), ...init?.headers } })
@@ -66,7 +66,7 @@ async function request(path: string, init?: RequestInit): Promise<unknown> {
   }
 
   const body = (await response.json().catch(() => null)) as unknown
-  if (!response.ok) {
+  if (!response.ok && !acceptedStatuses.includes(response.status)) {
     const record = isRecord(body) ? body : {}
     const detail = isRecord(record.error) ? record.error : isRecord(record.detail) ? record.detail : record
     const code = typeof detail.code === 'string' ? detail.code : `http_${response.status}`
@@ -186,8 +186,16 @@ export interface HealthStatus {
   status: string
   database?: boolean | string
   roots?: boolean | string | Record<string, string | boolean>
+  cloud?: boolean
+  legacy_journal?: boolean
+  apply_enabled?: boolean
+  apply_ready?: boolean
 }
 
 export async function getHealth(): Promise<HealthStatus> {
-  return (await request('/api/health')) as HealthStatus
+  const value = await request('/api/health', { cache: 'no-store' }, [503])
+  if (!isRecord(value) || typeof value.status !== 'string') {
+    throw new ApiError(0, 'invalid_health_response', '服务健康响应无效，请稍后重试。')
+  }
+  return value as unknown as HealthStatus
 }

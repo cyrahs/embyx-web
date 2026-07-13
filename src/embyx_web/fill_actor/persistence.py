@@ -6,7 +6,10 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 
+from embyx_web.fill_actor.cloud_moves import CloudFileMetadata
 from embyx_web.fill_actor.models import FillActorPlan, MoveResult
+
+SHA256_HEX_LENGTH = 64
 
 
 class JobState(StrEnum):
@@ -74,6 +77,29 @@ class MoveJournalState(StrEnum):
     RECONCILED = 'reconciled'
 
 
+class CandidateKind(StrEnum):
+    LOCAL_FILE = 'local_file'
+    CLOUD_STRM = 'cloud_strm'
+
+
+class CloudMoveOperationState(StrEnum):
+    PREPARED = 'prepared'
+    SUBMITTING = 'submitting'
+    VERIFYING = 'verifying'
+    UNKNOWN = 'unknown'
+    SUCCEEDED = 'succeeded'
+    CONFLICT = 'conflict'
+    FAILED = 'failed'
+
+    @property
+    def terminal(self) -> bool:
+        return self in {
+            CloudMoveOperationState.SUCCEEDED,
+            CloudMoveOperationState.CONFLICT,
+            CloudMoveOperationState.FAILED,
+        }
+
+
 @dataclass(frozen=True)
 class FileFingerprint:
     device: int
@@ -91,6 +117,32 @@ class CandidateRecord:
     source_root: Path
     destination: Path
     fingerprint: FileFingerprint
+    kind: CandidateKind = CandidateKind.LOCAL_FILE
+    mapping_sha256: str | None = None
+    cloud_source_path: str | None = None
+    cloud_destination_dir: str | None = None
+    cloud_file: CloudFileMetadata | None = None
+
+    def __post_init__(self) -> None:
+        cloud_values = (
+            self.mapping_sha256,
+            self.cloud_source_path,
+            self.cloud_destination_dir,
+            self.cloud_file,
+        )
+        if self.kind is CandidateKind.LOCAL_FILE and any(value is not None for value in cloud_values):
+            msg = 'local candidates must not contain CloudDrive metadata'
+            raise ValueError(msg)
+        if self.kind is CandidateKind.CLOUD_STRM:
+            if any(value is None for value in cloud_values):
+                msg = 'CloudDrive candidates require mapping and remote metadata'
+                raise ValueError(msg)
+            if self.cloud_file is not None and self.cloud_file.path != self.cloud_source_path:
+                msg = 'CloudDrive candidate metadata path must match its source path'
+                raise ValueError(msg)
+            if self.mapping_sha256 is None or len(self.mapping_sha256) != SHA256_HEX_LENGTH:
+                msg = 'CloudDrive candidate mapping digest is invalid'
+                raise ValueError(msg)
 
 
 @dataclass(frozen=True)
@@ -231,10 +283,44 @@ class MoveJournalRecord:
     updated_at: datetime
 
 
+@dataclass(frozen=True)
+class CloudMoveOperationRecord:
+    plan_id: str
+    candidate_id: str
+    attempt_id: str
+    source_path: str
+    destination_dir: str
+    state: CloudMoveOperationState
+    updated_at: datetime
+    error_code: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.attempt_id or not self.source_path or not self.destination_dir:
+            msg = 'CloudDrive operation identifiers and paths must not be empty'
+            raise ValueError(msg)
+        error_states = {
+            CloudMoveOperationState.UNKNOWN,
+            CloudMoveOperationState.CONFLICT,
+            CloudMoveOperationState.FAILED,
+        }
+        if self.state in error_states and self.error_code is None:
+            msg = 'non-successful CloudDrive operations require an error code'
+            raise ValueError(msg)
+        if self.state not in error_states and self.error_code is not None:
+            msg = 'successful or in-progress CloudDrive operations must not carry an error code'
+            raise ValueError(msg)
+
+
 class InvalidMoveJournalTransitionError(ValueError):
     def __init__(self, current: MoveJournalState | None, requested: MoveJournalState) -> None:
         current_value = current.value if current is not None else 'none'
         super().__init__(f'invalid move journal transition: {current_value} -> {requested.value}')
+
+
+class InvalidCloudMoveTransitionError(ValueError):
+    def __init__(self, current: CloudMoveOperationState | None, requested: CloudMoveOperationState) -> None:
+        current_value = current.value if current is not None else 'none'
+        super().__init__(f'invalid CloudDrive move transition: {current_value} -> {requested.value}')
 
 
 class FillActorRepository(Protocol):
@@ -329,6 +415,18 @@ class FillActorRepository(Protocol):
 
     async def list_unreconciled_moves(self) -> tuple[MoveJournalRecord, ...]: ...
 
+    async def save_cloud_move_operation(self, record: CloudMoveOperationRecord) -> None: ...
+
+    async def get_cloud_move_operation(
+        self,
+        plan_id: str,
+        candidate_id: str,
+    ) -> CloudMoveOperationRecord | None: ...
+
+    async def list_unresolved_cloud_moves(self) -> tuple[CloudMoveOperationRecord, ...]: ...
+
+    async def finalize_cloud_move(self, operation: CloudMoveOperationRecord, result: MoveResult) -> None: ...
+
     async def health_check(self) -> bool: ...
 
 
@@ -339,6 +437,7 @@ class MemoryFillActorRepository:
         self._jobs: dict[str, JobRecord] = {}
         self._job_feeds: dict[tuple[str, str], JobFeedRecord] = {}
         self._move_journal: dict[tuple[str, str], MoveJournalRecord] = {}
+        self._cloud_move_operations: dict[tuple[str, str], CloudMoveOperationRecord] = {}
         self._lock = asyncio.Lock()
 
     async def save_plan(self, record: PlanRecord) -> None:
@@ -356,6 +455,11 @@ class MemoryFillActorRepository:
                 for key, journal in self._move_journal.items()
                 if key[0] != plan_id or key[1] in candidate_ids
             }
+            self._cloud_move_operations = {
+                key: operation
+                for key, operation in self._cloud_move_operations.items()
+                if key[0] != plan_id or key[1] in candidate_ids
+            }
 
     async def get_plan(self, plan_id: str) -> PlanRecord | None:
         async with self._lock:
@@ -371,6 +475,9 @@ class MemoryFillActorRepository:
             if any(
                 key[0] == plan_id and journal.state is not MoveJournalState.RECONCILED
                 for key, journal in self._move_journal.items()
+            ) or any(
+                key[0] == plan_id and not operation.state.terminal
+                for key, operation in self._cloud_move_operations.items()
             ):
                 return False
             removed = self._plans.pop(plan_id, None) is not None
@@ -388,6 +495,10 @@ class MemoryFillActorRepository:
                 and not any(
                     key[0] == plan_id and journal.state is not MoveJournalState.RECONCILED
                     for key, journal in self._move_journal.items()
+                )
+                and not any(
+                    key[0] == plan_id and not operation.state.terminal
+                    for key, operation in self._cloud_move_operations.items()
                 )
             ]
             for plan_id in expired:
@@ -702,12 +813,47 @@ class MemoryFillActorRepository:
             ]
             return tuple(sorted(records, key=lambda record: (record.updated_at, record.plan_id, record.candidate_id)))
 
+    async def save_cloud_move_operation(self, record: CloudMoveOperationRecord) -> None:
+        if record.state.terminal:
+            msg = 'terminal CloudDrive operations must be finalized with their result'
+            raise ValueError(msg)
+        async with self._lock:
+            self._save_cloud_move_operation_locked(record)
+
+    async def get_cloud_move_operation(
+        self,
+        plan_id: str,
+        candidate_id: str,
+    ) -> CloudMoveOperationRecord | None:
+        async with self._lock:
+            return self._cloud_move_operations.get((plan_id, candidate_id))
+
+    async def list_unresolved_cloud_moves(self) -> tuple[CloudMoveOperationRecord, ...]:
+        async with self._lock:
+            records = [operation for operation in self._cloud_move_operations.values() if not operation.state.terminal]
+            return tuple(sorted(records, key=lambda record: (record.updated_at, record.plan_id, record.candidate_id)))
+
+    async def finalize_cloud_move(self, operation: CloudMoveOperationRecord, result: MoveResult) -> None:
+        async with self._lock:
+            if not operation.state.terminal:
+                msg = 'finalized CloudDrive operation must be terminal'
+                raise ValueError(msg)
+            self._require_matching_candidate(operation.plan_id, result.candidate_id, result.video_id)
+            if result.candidate_id != operation.candidate_id:
+                msg = 'CloudDrive result must match its operation'
+                raise ValueError(msg)
+            self._save_cloud_move_operation_locked(operation)
+            self._move_results[(operation.plan_id, operation.candidate_id)] = result
+
     async def health_check(self) -> bool:
         return True
 
     def _delete_plan_dependents(self, plan_id: str) -> None:
         self._move_results = {key: result for key, result in self._move_results.items() if key[0] != plan_id}
         self._move_journal = {key: record for key, record in self._move_journal.items() if key[0] != plan_id}
+        self._cloud_move_operations = {
+            key: record for key, record in self._cloud_move_operations.items() if key[0] != plan_id
+        }
         self._jobs = {
             job_id: record if record.plan_id != plan_id else _without_plan(record)
             for job_id, record in self._jobs.items()
@@ -719,6 +865,39 @@ class MemoryFillActorRepository:
         if candidate is None:
             raise KeyError((plan_id, candidate_id))
         return candidate
+
+    def _save_cloud_move_operation_locked(self, record: CloudMoveOperationRecord) -> None:
+        candidate = self._require_candidate(record.plan_id, record.candidate_id)
+        if candidate.kind is not CandidateKind.CLOUD_STRM:
+            msg = 'CloudDrive operations require a CloudDrive candidate'
+            raise ValueError(msg)
+        if (
+            candidate.cloud_source_path != record.source_path
+            or candidate.cloud_destination_dir != record.destination_dir
+        ):
+            msg = 'CloudDrive operation paths must match its candidate'
+            raise ValueError(msg)
+        key = (record.plan_id, record.candidate_id)
+        current = self._cloud_move_operations.get(key)
+        validate_cloud_move_transition(current.state if current is not None else None, record.state)
+        if current is not None and current.attempt_id != record.attempt_id:
+            msg = 'CloudDrive operation attempt id cannot change'
+            raise ValueError(msg)
+        if not record.state.terminal:
+            duplicate = next(
+                (
+                    operation
+                    for operation_key, operation in self._cloud_move_operations.items()
+                    if operation_key != key
+                    and operation.source_path == record.source_path
+                    and not operation.state.terminal
+                ),
+                None,
+            )
+            if duplicate is not None:
+                msg = 'CloudDrive source already has an unresolved operation'
+                raise ValueError(msg)
+        self._cloud_move_operations[key] = record
 
     def _require_matching_candidate(self, plan_id: str, candidate_id: str, video_id: str) -> None:
         candidate = self._require_candidate(plan_id, candidate_id)
@@ -750,6 +929,49 @@ _ALLOWED_JOURNAL_TRANSITIONS: dict[MoveJournalState | None, Sequence[MoveJournal
 def validate_journal_transition(current: MoveJournalState | None, requested: MoveJournalState) -> None:
     if requested not in _ALLOWED_JOURNAL_TRANSITIONS[current]:
         raise InvalidMoveJournalTransitionError(current, requested)
+
+
+_ALLOWED_CLOUD_MOVE_TRANSITIONS: dict[
+    CloudMoveOperationState | None,
+    Sequence[CloudMoveOperationState],
+] = {
+    None: (CloudMoveOperationState.PREPARED,),
+    CloudMoveOperationState.PREPARED: (
+        CloudMoveOperationState.PREPARED,
+        CloudMoveOperationState.SUBMITTING,
+        CloudMoveOperationState.CONFLICT,
+        CloudMoveOperationState.FAILED,
+    ),
+    CloudMoveOperationState.SUBMITTING: (
+        CloudMoveOperationState.SUBMITTING,
+        CloudMoveOperationState.VERIFYING,
+        CloudMoveOperationState.UNKNOWN,
+    ),
+    CloudMoveOperationState.VERIFYING: (
+        CloudMoveOperationState.VERIFYING,
+        CloudMoveOperationState.UNKNOWN,
+        CloudMoveOperationState.SUCCEEDED,
+        CloudMoveOperationState.CONFLICT,
+        CloudMoveOperationState.FAILED,
+    ),
+    CloudMoveOperationState.UNKNOWN: (
+        CloudMoveOperationState.UNKNOWN,
+        CloudMoveOperationState.SUCCEEDED,
+        CloudMoveOperationState.CONFLICT,
+        CloudMoveOperationState.FAILED,
+    ),
+    CloudMoveOperationState.SUCCEEDED: (CloudMoveOperationState.SUCCEEDED,),
+    CloudMoveOperationState.CONFLICT: (CloudMoveOperationState.CONFLICT,),
+    CloudMoveOperationState.FAILED: (CloudMoveOperationState.FAILED,),
+}
+
+
+def validate_cloud_move_transition(
+    current: CloudMoveOperationState | None,
+    requested: CloudMoveOperationState,
+) -> None:
+    if requested not in _ALLOWED_CLOUD_MOVE_TRANSITIONS[current]:
+        raise InvalidCloudMoveTransitionError(current, requested)
 
 
 def normalize_datetime(value: datetime) -> datetime:
