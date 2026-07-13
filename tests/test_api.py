@@ -12,6 +12,7 @@ from embyx_web.api import ActorFeedView, JobProgressView, create_app
 from embyx_web.fill_actor.feeds import RSSHubFeedWarmer
 from embyx_web.fill_actor.jobs import FillActorJobManager
 from embyx_web.fill_actor.persistence import (
+    JOB_CANCELLED_ERROR_CODE,
     JobFeedRecord,
     JobFeedState,
     JobProgress,
@@ -35,7 +36,8 @@ class BlockingActorCatalog:
 
     async def list_video_ids(self, _actor_id: str) -> list[str]:
         self.started.set()
-        assert await asyncio.to_thread(self.release.wait, 2)
+        while not self.release.is_set():  # noqa: ASYNC110 - bridges TestClient's thread and event loop
+            await asyncio.sleep(0.005)
         return ['ABC-001']
 
 
@@ -238,6 +240,52 @@ def test_mutations_require_configured_bearer_token(tmp_path: Path) -> None:
     assert denied.json() == {'error': {'code': 'unauthorized'}}
     assert 'WWW-Authenticate' in denied.headers
     assert allowed.status_code == 202
+
+
+def test_cancel_running_plan_is_authenticated_idempotent_and_does_not_require_roots(tmp_path: Path) -> None:
+    token = 'cancel-token'  # noqa: S105
+    actor_catalog = BlockingActorCatalog()
+    client, paths, _ = make_client(tmp_path, api_token=token, actor_catalog=actor_catalog)
+    headers = {'Authorization': f'Bearer {token}'}
+    try:
+        with client:
+            created = client.post('/api/fill-actor/plans', json={'actor_ids': ['actor']}, headers=headers)
+            plan_id = created.json()['job']['plan_id']
+            assert actor_catalog.started.wait(timeout=1)
+            paths.move_in_path.rmdir()
+
+            denied = client.post(f'/api/fill-actor/plans/{plan_id}/cancel')
+            cancelled = client.post(f'/api/fill-actor/plans/{plan_id}/cancel', headers=headers)
+            repeated = client.post(f'/api/fill-actor/plans/{plan_id}/cancel', headers=headers)
+            current = client.get(f'/api/fill-actor/plans/{plan_id}')
+
+        assert denied.status_code == 401
+        assert cancelled.status_code == 200
+        assert cancelled.json()['job']['state'] == 'failed'
+        assert cancelled.json()['job']['error_code'] == JOB_CANCELLED_ERROR_CODE
+        assert cancelled.json()['plan'] is None
+        assert repeated.status_code == 200
+        assert repeated.json()['job']['error_code'] == JOB_CANCELLED_ERROR_CODE
+        assert current.status_code == 200
+        assert current.json()['job']['error_code'] == JOB_CANCELLED_ERROR_CODE
+        assert current.json()['plan'] is None
+    finally:
+        actor_catalog.release.set()
+
+
+def test_cancel_unknown_or_completed_plan_has_stable_response(tmp_path: Path) -> None:
+    client, _, _ = make_client(tmp_path)
+    with client:
+        unknown = client.post('/api/fill-actor/plans/not-found/cancel')
+        created = client.post('/api/fill-actor/plans', json={'actor_ids': ['actor']})
+        plan_id = created.json()['job']['plan_id']
+        assert wait_for_plan(client, plan_id)['job']['state'] == 'completed'
+        completed = client.post(f'/api/fill-actor/plans/{plan_id}/cancel')
+
+    assert unknown.status_code == 404
+    assert unknown.json() == {'error': {'code': 'unknown_plan'}}
+    assert completed.status_code == 409
+    assert completed.json() == {'error': {'code': 'plan_not_cancellable'}}
 
 
 def test_api_maps_service_errors_without_raw_messages(tmp_path: Path) -> None:

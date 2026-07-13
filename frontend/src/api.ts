@@ -138,6 +138,7 @@ export function normalizePlanEnvelope(value: unknown): PlanEnvelope {
     plan?.plan_id ??
     (typeof value.plan_id === 'string' ? value.plan_id : null) ??
     (job && typeof job.plan_id === 'string' ? job.plan_id : null) ??
+    (job && typeof job.job_id === 'string' ? job.job_id : null) ??
     (job && typeof job.id === 'string' ? job.id : null)
   return { plan, job, planId, feeds }
 }
@@ -159,6 +160,12 @@ export async function createPlan(actorIds: string[]): Promise<PlanEnvelope> {
 export async function getPlan(planId: string, signal?: AbortSignal): Promise<PlanEnvelope> {
   return normalizePlanEnvelope(
     await request(`/api/fill-actor/plans/${encodeURIComponent(planId)}`, { cache: 'no-store', signal }),
+  )
+}
+
+export async function cancelPlan(planId: string, signal?: AbortSignal): Promise<PlanEnvelope> {
+  return normalizePlanEnvelope(
+    await request(`/api/fill-actor/plans/${encodeURIComponent(planId)}/cancel`, { method: 'POST', signal }),
   )
 }
 

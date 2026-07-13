@@ -96,6 +96,9 @@ textarea:disabled { opacity: .6; cursor: wait; }
 .progress-meta dd { margin: 0; color: #b8bbb8; font: 500 10px/1.4 'DM Mono', monospace; overflow-wrap: anywhere; }
 .progress-warnings { display: flex; flex-direction: column; gap: 5px; color: var(--amber); font-size: 10px; }
 .progress-warnings p { margin: 0; }
+.progress-actions { display: flex; justify-content: flex-end; }
+.button.secondary.cancel-scan-button { min-height: 36px; padding: 0 13px; color: #d4aaa7; border-color: rgba(239, 125, 119, .32); font-size: 10px; }
+.button.secondary.cancel-scan-button:hover:not(:disabled) { color: #f1c3bf; border-color: rgba(239, 125, 119, .56); }
 @keyframes slide { from { transform: translateX(-110%); } to { transform: translateX(310%); } }
 
 .notice { margin-top: 17px; padding: 17px 19px; border-radius: 9px; display: flex; align-items: center; gap: 14px; border: 1px solid; }
@@ -108,6 +111,8 @@ textarea:disabled { opacity: .6; cursor: wait; }
 .notice-error > span { color: var(--red); background: rgba(239, 125, 119, .1); }
 .notice-warning { border-color: rgba(242, 184, 91, .3); background: rgba(242, 184, 91, .045); }
 .notice-warning > span { color: var(--amber); background: rgba(242, 184, 91, .1); }
+.notice-neutral { border-color: rgba(133, 140, 148, .28); background: rgba(133, 140, 148, .045); }
+.notice-neutral > span { color: #a4aab0; background: rgba(133, 140, 148, .1); }
 .text-button { border: 0; padding: 6px 4px; color: var(--accent); background: none; white-space: nowrap; display: inline-flex; align-items: center; gap: 3px; cursor: pointer; font-size: 12px; font-weight: 700; }
 .text-button svg { width: 15px; }
 
@@ -222,6 +227,7 @@ textarea:disabled { opacity: .6; cursor: wait; }
   .scan-button { width: 100%; }
   .progress-panel { padding: 17px; grid-template-columns: auto minmax(0, 1fr); }
   .progress-meta { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .progress-actions, .cancel-scan-button { width: 100%; }
   .summary-strip { grid-template-columns: repeat(2, 1fr); }
   .summary-strip > div { border-bottom: 1px solid #25292e; }
   .summary-strip > div:nth-child(2n) { border-right: 0; }

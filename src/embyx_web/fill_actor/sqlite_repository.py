@@ -8,6 +8,9 @@ from pathlib import Path
 
 from embyx_web.fill_actor.models import FillActorPlan, MoveResult
 from embyx_web.fill_actor.persistence import (
+    JOB_CANCELLED_ERROR_CODE,
+    CancelJobOutcome,
+    CancelJobResult,
     CandidateRecord,
     FileFingerprint,
     JobFeedErrorCode,
@@ -260,6 +263,9 @@ class SQLiteFillActorRepository:
         progress: JobProgress,
     ) -> bool:
         return await _run_sync(self._finish_owned_job, job_id, owner_id, state, error_code, now, progress)
+
+    async def cancel_job(self, *, job_id: str, now: datetime) -> CancelJobResult:
+        return await _run_sync(self._cancel_job, job_id, now)
 
     async def fail_expired_jobs(self, *, now: datetime, error_code: str) -> int:
         return await _run_sync(self._fail_expired_jobs, now, error_code)
@@ -666,6 +672,67 @@ class SQLiteFillActorRepository:
             )
             return cursor.rowcount == 1
 
+    def _cancel_job(self, job_id: str, now: datetime) -> CancelJobResult:
+        with closing(self._connect()) as connection, connection:
+            connection.execute('BEGIN IMMEDIATE')
+            row = connection.execute('SELECT * FROM jobs WHERE job_id = ?', (job_id,)).fetchone()
+            if row is None:
+                return CancelJobResult(CancelJobOutcome.NOT_FOUND, None)
+
+            current = _job_from_row(row)
+            if current.state is JobState.FAILED and current.error_code == JOB_CANCELLED_ERROR_CODE:
+                return CancelJobResult(
+                    CancelJobOutcome.ALREADY_CANCELLED,
+                    current,
+                    previous_state=current.state,
+                    previous_owner_id=current.owner_id,
+                )
+            if current.state not in {JobState.QUEUED, JobState.RUNNING}:
+                return CancelJobResult(
+                    CancelJobOutcome.ALREADY_TERMINAL,
+                    current,
+                    previous_state=current.state,
+                    previous_owner_id=current.owner_id,
+                )
+
+            progress = _terminal_progress(current, now)
+            cursor = connection.execute(
+                """
+                UPDATE jobs SET
+                    state = 'failed', updated_at = ?, error_code = ?, owner_id = NULL, lease_expires_at = NULL,
+                    progress_stage = ?, progress_completed = ?, progress_total = ?, progress_unit = ?,
+                    progress_current = ?, progress_stage_started_at = ?, progress_updated_at = ?
+                WHERE job_id = ? AND state IN ('queued', 'running')
+                """,
+                (
+                    _datetime_to_text(now),
+                    JOB_CANCELLED_ERROR_CODE,
+                    *_progress_values(progress),
+                    job_id,
+                ),
+            )
+            if cursor.rowcount != 1:  # pragma: no cover - BEGIN IMMEDIATE serializes competing writers
+                msg = 'cancelled job transition was not atomic'
+                raise RuntimeError(msg)
+            connection.execute(
+                """
+                UPDATE job_feeds
+                SET state = 'failed', updated_at = ?, error_code = ?
+                WHERE job_id = ? AND state IN ('queued', 'warming')
+                """,
+                (_datetime_to_text(now), JobFeedErrorCode.CANCELLED.value, job_id),
+            )
+            cancelled_row = connection.execute('SELECT * FROM jobs WHERE job_id = ?', (job_id,)).fetchone()
+            if cancelled_row is None:  # pragma: no cover - same transaction retains the row
+                msg = 'cancelled job disappeared'
+                raise RuntimeError(msg)
+            return CancelJobResult(
+                CancelJobOutcome.CANCELLED,
+                _job_from_row(cancelled_row),
+                previous_state=current.state,
+                previous_owner_id=current.owner_id,
+            )
+
     def _fail_expired_jobs(self, now: datetime, error_code: str) -> int:
         with closing(self._connect()) as connection, connection:
             connection.execute('BEGIN IMMEDIATE')
@@ -960,6 +1027,19 @@ def _progress_from_row(row: sqlite3.Row) -> JobProgress:
         current=row['progress_current'],
         stage_started_at=datetime.fromisoformat(row['progress_stage_started_at']),
         updated_at=datetime.fromisoformat(row['progress_updated_at']),
+    )
+
+
+def _terminal_progress(record: JobRecord, now: datetime) -> JobProgress:
+    progress = _require_progress(record)
+    return JobProgress(
+        stage=JobStage.DONE,
+        completed=progress.completed,
+        total=progress.total,
+        unit=progress.unit,
+        current=progress.current,
+        stage_started_at=now,
+        updated_at=now,
     )
 
 

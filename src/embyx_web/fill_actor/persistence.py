@@ -17,6 +17,16 @@ class JobState(StrEnum):
     FAILED = 'failed'
 
 
+JOB_CANCELLED_ERROR_CODE = 'job_cancelled'
+
+
+class CancelJobOutcome(StrEnum):
+    CANCELLED = 'cancelled'
+    ALREADY_CANCELLED = 'already_cancelled'
+    ALREADY_TERMINAL = 'already_terminal'
+    NOT_FOUND = 'not_found'
+
+
 class JobOperation(StrEnum):
     CREATE_PLAN = 'create_plan'
     APPLY = 'apply'
@@ -181,6 +191,14 @@ class JobRecord:
 
 
 @dataclass(frozen=True)
+class CancelJobResult:
+    outcome: CancelJobOutcome
+    job: JobRecord | None
+    previous_state: JobState | None = None
+    previous_owner_id: str | None = None
+
+
+@dataclass(frozen=True)
 class JobFeedRecord:
     job_id: str
     actor_id: str
@@ -282,6 +300,8 @@ class FillActorRepository(Protocol):
         now: datetime,
         progress: JobProgress,
     ) -> bool: ...
+
+    async def cancel_job(self, *, job_id: str, now: datetime) -> CancelJobResult: ...
 
     async def fail_expired_jobs(self, *, now: datetime, error_code: str) -> int: ...
 
@@ -522,6 +542,54 @@ class MemoryFillActorRepository:
                 progress=progress,
             )
             return True
+
+    async def cancel_job(self, *, job_id: str, now: datetime) -> CancelJobResult:
+        async with self._lock:
+            current = self._jobs.get(job_id)
+            if current is None:
+                return CancelJobResult(CancelJobOutcome.NOT_FOUND, None)
+            if current.state is JobState.FAILED and current.error_code == JOB_CANCELLED_ERROR_CODE:
+                return CancelJobResult(
+                    CancelJobOutcome.ALREADY_CANCELLED,
+                    current,
+                    previous_state=current.state,
+                    previous_owner_id=current.owner_id,
+                )
+            if current.state not in {JobState.QUEUED, JobState.RUNNING}:
+                return CancelJobResult(
+                    CancelJobOutcome.ALREADY_TERMINAL,
+                    current,
+                    previous_state=current.state,
+                    previous_owner_id=current.owner_id,
+                )
+
+            cancelled = _replace_job(
+                current,
+                state=JobState.FAILED,
+                updated_at=now,
+                error_code=JOB_CANCELLED_ERROR_CODE,
+                owner_id=None,
+                lease_expires_at=None,
+                progress=_terminal_progress(current.progress, now),
+            )
+            self._jobs[job_id] = cancelled
+            for key, feed in tuple(self._job_feeds.items()):
+                if key[0] == job_id and feed.state in {JobFeedState.QUEUED, JobFeedState.WARMING}:
+                    self._job_feeds[key] = JobFeedRecord(
+                        job_id=feed.job_id,
+                        actor_id=feed.actor_id,
+                        state=JobFeedState.FAILED,
+                        attempts=feed.attempts,
+                        updated_at=now,
+                        error_code=JobFeedErrorCode.CANCELLED,
+                        freshrss_add_url=feed.freshrss_add_url,
+                    )
+            return CancelJobResult(
+                CancelJobOutcome.CANCELLED,
+                cancelled,
+                previous_state=current.state,
+                previous_owner_id=current.owner_id,
+            )
 
     async def fail_expired_jobs(self, *, now: datetime, error_code: str) -> int:
         async with self._lock:
