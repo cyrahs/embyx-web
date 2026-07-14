@@ -8,6 +8,8 @@ import pytest
 
 from embyx_web.fill_actor.models import (
     ActorPlan,
+    ApplyResult,
+    ApplyState,
     FillActorPlan,
     MoveCandidate,
     MoveResult,
@@ -17,8 +19,10 @@ from embyx_web.fill_actor.models import (
 )
 from embyx_web.fill_actor.persistence import (
     JOB_CANCELLED_ERROR_CODE,
+    ApplyJobRecord,
     CancelJobOutcome,
     CandidateRecord,
+    EnqueueApplyJobOutcome,
     FileFingerprint,
     InvalidMoveJournalTransitionError,
     JobFeedErrorCode,
@@ -171,6 +175,114 @@ async def test_repository_contract_round_trips_persistent_records(
     await repository.save_move_journal(journal)
     assert await repository.get_move_journal(plan.public.plan_id, 'candidate-1') == journal
     assert await repository.list_unreconciled_moves() == (journal,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('repository_kind', ['memory', 'sqlite'])
+async def test_apply_jobs_are_idempotent_atomic_and_protect_their_plan(
+    tmp_path: Path,
+    repository_kind: str,
+) -> None:
+    repository = make_repository(repository_kind, tmp_path)
+    plan = make_plan_record(tmp_path)
+    await repository.save_plan(plan)
+    now = plan.public.created_at
+    job = JobRecord(
+        job_id='apply-request-0001',
+        plan_id=plan.public.plan_id,
+        operation=JobOperation.APPLY,
+        state=JobState.QUEUED,
+        created_at=now,
+        updated_at=now,
+        progress=JobProgress(
+            stage=JobStage.QUEUED,
+            completed=0,
+            total=1,
+            unit=JobProgressUnit.ITEMS,
+            current=None,
+            stage_started_at=now,
+            updated_at=now,
+        ),
+    )
+    record = ApplyJobRecord(
+        job=job,
+        revision=plan.public.revision,
+        candidate_ids=('candidate-1',),
+    )
+
+    enqueued = await repository.enqueue_apply_job(record, max_active=1)
+    repeated = await repository.enqueue_apply_job(record, max_active=1)
+    conflict = await repository.enqueue_apply_job(
+        ApplyJobRecord(job=job, revision='different-revision', candidate_ids=('candidate-1',)),
+        max_active=1,
+    )
+
+    assert enqueued.outcome is EnqueueApplyJobOutcome.ENQUEUED
+    assert enqueued.record == record
+    assert repeated.outcome is EnqueueApplyJobOutcome.EXISTING
+    assert repeated.record == record
+    assert conflict.outcome is EnqueueApplyJobOutcome.CONFLICT
+    assert conflict.record is None
+    assert not await repository.delete_plan(plan.public.plan_id)
+    assert await repository.purge_expired_plans(plan.public.expires_at + timedelta(seconds=1)) == 0
+
+    claimed = await repository.claim_next_job(
+        owner_id='owner',
+        now=now + timedelta(seconds=1),
+        lease_expires_at=now + timedelta(seconds=31),
+    )
+    assert claimed is not None
+    terminal_progress = JobProgress(
+        stage=JobStage.DONE,
+        completed=1,
+        total=1,
+        unit=JobProgressUnit.ITEMS,
+        current=None,
+        stage_started_at=now + timedelta(seconds=2),
+        updated_at=now + timedelta(seconds=2),
+    )
+    result = ApplyResult(
+        plan_id=plan.public.plan_id,
+        revision=plan.public.revision,
+        state=ApplyState.SUCCEEDED,
+        results=(
+            MoveResult(
+                candidate_id='candidate-1',
+                video_id='ABC-001',
+                file_name='ABC-001.mp4',
+                state=MoveState.MOVED,
+            ),
+        ),
+    )
+    assert not await repository.finish_owned_job(
+        job_id=job.job_id,
+        owner_id='stale-owner',
+        state=JobState.COMPLETED,
+        error_code=None,
+        now=now + timedelta(seconds=2),
+        progress=terminal_progress,
+        apply_result=result,
+    )
+    assert (await repository.get_apply_job(job.job_id)).result is None
+    assert await repository.finish_owned_job(
+        job_id=job.job_id,
+        owner_id='owner',
+        state=JobState.COMPLETED,
+        error_code=None,
+        now=now + timedelta(seconds=2),
+        progress=terminal_progress,
+        apply_result=result,
+    )
+    saved = await repository.get_apply_job(job.job_id)
+    assert saved is not None
+    assert saved.job.state is JobState.COMPLETED
+    assert saved.result == result
+
+    assert await repository.delete_plan(plan.public.plan_id)
+    detached = await repository.get_apply_job(job.job_id)
+    assert detached is not None
+    assert detached.job.plan_id is None
+    assert detached.result == result
 
 
 @pytest.mark.asyncio
@@ -355,6 +467,7 @@ def test_sqlite_repository_applies_explicit_schema_migration(tmp_path: Path) -> 
     assert version == CURRENT_SCHEMA_VERSION
     assert tables == {
         'schema_migrations',
+        'apply_jobs',
         'plans',
         'candidates',
         'cloud_move_operations',
@@ -365,6 +478,32 @@ def test_sqlite_repository_applies_explicit_schema_migration(tmp_path: Path) -> 
         'health_probe',
     }
     assert "'pages'" in jobs_sql
+
+
+def test_sqlite_repository_migrates_v5_database_without_rewriting_jobs(tmp_path: Path) -> None:
+    database_path = tmp_path / 'fill-actor-v5.sqlite3'
+    repository = SQLiteFillActorRepository(database_path)
+    now = datetime(2026, 7, 13, 10, 0, tzinfo=UTC)
+    original = JobRecord(
+        job_id='existing-job',
+        operation=JobOperation.CREATE_PLAN,
+        state=JobState.COMPLETED,
+        created_at=now,
+        updated_at=now,
+    )
+    asyncio.run(repository.save_job(original))
+    with sqlite3.connect(database_path) as connection:
+        connection.execute('DROP TABLE apply_jobs')
+        connection.execute('DELETE FROM schema_migrations WHERE version = 6')
+
+    reopened = SQLiteFillActorRepository(database_path)
+
+    assert asyncio.run(reopened.get_job(original.job_id)) == original
+    with sqlite3.connect(database_path) as connection:
+        version = connection.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0]
+        columns = {row[1] for row in connection.execute("PRAGMA table_info('apply_jobs')")}
+    assert version == 6
+    assert columns == {'job_id', 'revision', 'candidate_ids_json', 'result_json'}
 
 
 def test_sqlite_repository_migrates_v2_jobs_with_compatible_progress(tmp_path: Path) -> None:
@@ -725,6 +864,47 @@ async def test_cancel_queued_job_prevents_claim_and_releases_capacity(tmp_path: 
         updated_at=now + timedelta(seconds=2),
     )
     assert await repository.enqueue_job(replacement, max_active=1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('repository_kind', ['memory', 'sqlite'])
+async def test_apply_job_cancellation_is_rejected_atomically_before_and_after_enqueue(
+    tmp_path: Path,
+    repository_kind: str,
+) -> None:
+    repository = make_repository(repository_kind, tmp_path)
+    now = datetime(2026, 7, 13, 10, 0, tzinfo=UTC)
+    job_id = 'apply-cancel-race'
+
+    before_enqueue = await repository.cancel_job(job_id=job_id, now=now)
+    assert before_enqueue.outcome is CancelJobOutcome.NOT_FOUND
+
+    queued = JobRecord(
+        job_id=job_id,
+        plan_id='plan-1',
+        operation=JobOperation.APPLY,
+        state=JobState.QUEUED,
+        created_at=now,
+        updated_at=now,
+    )
+    record = ApplyJobRecord(job=queued, revision='revision-1', candidate_ids=('candidate-1',))
+    assert (await repository.enqueue_apply_job(record, max_active=1)).outcome is EnqueueApplyJobOutcome.ENQUEUED
+
+    while_queued = await repository.cancel_job(job_id=job_id, now=now + timedelta(seconds=1))
+    assert while_queued.outcome is CancelJobOutcome.NOT_CANCELLABLE
+    assert while_queued.job == queued
+    assert await repository.get_job(job_id) == queued
+
+    claimed = await repository.claim_next_job(
+        owner_id='owner',
+        now=now + timedelta(seconds=2),
+        lease_expires_at=now + timedelta(seconds=32),
+    )
+    assert claimed is not None
+    while_running = await repository.cancel_job(job_id=job_id, now=now + timedelta(seconds=3))
+    assert while_running.outcome is CancelJobOutcome.NOT_CANCELLABLE
+    assert while_running.job == claimed
+    assert await repository.get_job(job_id) == claimed
 
 
 @pytest.mark.asyncio

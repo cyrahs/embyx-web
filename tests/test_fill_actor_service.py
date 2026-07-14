@@ -538,6 +538,66 @@ async def test_apply_moves_candidate_and_is_idempotent(paths: FillActorPaths) ->
 
 
 @pytest.mark.asyncio
+async def test_apply_reports_file_level_progress_and_stops_between_candidates(paths: FillActorPaths) -> None:
+    first_source = create_move_candidate(paths, video_id='ABC-001')
+    second_source = create_move_candidate(paths, video_id='ABC-002')
+    service, _ = make_service(
+        paths,
+        catalog={'actor': ['ABC-001', 'ABC-002']},
+        brands={'ABC-001': 'ABC', 'ABC-002': 'ABC'},
+        apply_enabled=True,
+    )
+    plan = await service.create_plan(['actor'])
+    candidates = tuple(candidate for video in plan.videos for candidate in video.move_candidates)
+    events: list[JobProgressEvent] = []
+    stop = False
+
+    async def progress(event: JobProgressEvent) -> None:
+        nonlocal stop
+        events.append(event)
+        if event.completed == 1:
+            stop = True
+
+    result = await service.apply(
+        plan_id=plan.plan_id,
+        revision=plan.revision,
+        candidate_ids=[candidate.candidate_id for candidate in candidates],
+        progress=progress,
+        stop_requested=lambda: stop,
+    )
+
+    assert [(event.completed, event.total, event.current) for event in events] == [
+        (0, 2, 'ABC-001.mp4'),
+        (1, 2, 'ABC-002.mp4'),
+    ]
+    assert all(event.stage is JobStage.UNKNOWN for event in events)
+    assert all(event.unit is JobProgressUnit.ITEMS for event in events)
+    assert len(result.results) == 1
+    assert not first_source.exists()
+    assert second_source.exists()
+
+    resumed_events: list[JobProgressEvent] = []
+
+    async def resumed_progress(event: JobProgressEvent) -> None:
+        resumed_events.append(event)
+
+    resumed = await service.apply(
+        plan_id=plan.plan_id,
+        revision=plan.revision,
+        candidate_ids=[candidate.candidate_id for candidate in candidates],
+        progress=resumed_progress,
+    )
+
+    assert [(event.completed, event.total, event.current) for event in resumed_events] == [
+        (0, 2, 'ABC-001.mp4'),
+        (1, 2, 'ABC-002.mp4'),
+        (2, 2, None),
+    ]
+    assert len(resumed.results) == 2
+    assert not second_source.exists()
+
+
+@pytest.mark.asyncio
 async def test_apply_can_move_into_brand_subdirectory(paths: FillActorPaths) -> None:
     source = create_move_candidate(paths)
     service, plan, candidate = await create_move_plan(paths, move_in_by_brand=True)

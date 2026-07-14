@@ -4,11 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from embyx_web.fill_actor.errors import FillActorError, JobQueueFullError
+from embyx_web.fill_actor.errors import ApplyJobNotCancellableError, FillActorError, JobQueueFullError
 from embyx_web.fill_actor.jobs import FillActorJobManager
-from embyx_web.fill_actor.models import FillActorPlan
+from embyx_web.fill_actor.models import ApplyResult, ApplyState, FillActorPlan, MoveResult, MoveState
 from embyx_web.fill_actor.persistence import (
     JOB_CANCELLED_ERROR_CODE,
+    ApplyJobRecord,
     CancelJobOutcome,
     JobOperation,
     JobProgress,
@@ -149,6 +150,18 @@ class PausedCancelRepository(MemoryFillActorRepository):
         self.cancel_persisted.set()
         await self.release_cancel.wait()
         return result
+
+
+class OwnershipLossRepository(MemoryFillActorRepository):
+    def __init__(self) -> None:
+        super().__init__()
+        self.rejected_renewal = asyncio.Event()
+
+    async def renew_owned_job_lease(self, **kwargs):
+        owned = await super().renew_owned_job_lease(**kwargs)
+        if not owned:
+            self.rejected_renewal.set()
+        return owned
 
 
 class CancellationAwareService(ControlledService):
@@ -299,6 +312,75 @@ class ScopeProgressService(ControlledService):
         )
 
 
+class ControlledApplyService(ControlledService):
+    def __init__(self, *, repository, block_apply: bool = False, result_state: ApplyState = ApplyState.SUCCEEDED):
+        super().__init__(repository=repository)
+        self.apply_started = asyncio.Event()
+        self.apply_release = asyncio.Event()
+        self.block_apply = block_apply
+        self.result_state = result_state
+        self.apply_calls: list[tuple[str, str, tuple[str, ...]]] = []
+        self.processed_candidates: list[str] = []
+
+    async def apply_ready(self) -> bool:
+        return True
+
+    async def apply(
+        self,
+        *,
+        plan_id,
+        revision,
+        candidate_ids,
+        progress=None,
+        stop_requested=None,
+    ) -> ApplyResult:
+        selected = tuple(candidate_ids)
+        self.apply_calls.append((plan_id, revision, selected))
+        self.apply_started.set()
+        if progress is not None:
+            await progress(
+                JobProgressEvent(
+                    stage=JobStage.UNKNOWN,
+                    completed=0,
+                    total=len(selected),
+                    unit=JobProgressUnit.ITEMS,
+                    current='ABC-001.mp4' if selected else None,
+                )
+            )
+        if self.block_apply:
+            await self.apply_release.wait()
+        results: list[MoveResult] = []
+        for index, candidate_id in enumerate(selected):
+            if index > 0 and stop_requested is not None and stop_requested():
+                break
+            self.processed_candidates.append(candidate_id)
+            results.append(
+                MoveResult(
+                    candidate_id=candidate_id,
+                    video_id='ABC-001',
+                    file_name='ABC-001.mp4',
+                    state=MoveState.MOVED if self.result_state is ApplyState.SUCCEEDED else MoveState.FAILED,
+                    error_code=None if self.result_state is ApplyState.SUCCEEDED else 'simulated_failure',
+                )
+            )
+            if progress is not None:
+                await progress(
+                    JobProgressEvent(
+                        stage=JobStage.UNKNOWN,
+                        completed=index + 1,
+                        total=len(selected),
+                        unit=JobProgressUnit.ITEMS,
+                        current=None,
+                    )
+                )
+        return ApplyResult(
+            plan_id=plan_id,
+            revision=revision,
+            state=self.result_state,
+            results=tuple(results),
+        )
+
+
 def make_repository(kind: str, tmp_path: Path):
     if kind == 'memory':
         return MemoryFillActorRepository()
@@ -312,6 +394,30 @@ async def wait_for_state(repository, job_id: str, states: set[JobState]) -> JobR
             return job
         await asyncio.sleep(0.005)
     pytest.fail('job did not reach expected state')
+
+
+def make_apply_job(*, now: datetime, job_id: str = 'apply-request-0001') -> ApplyJobRecord:
+    return ApplyJobRecord(
+        job=JobRecord(
+            job_id=job_id,
+            plan_id='plan-1',
+            operation=JobOperation.APPLY,
+            state=JobState.QUEUED,
+            created_at=now,
+            updated_at=now,
+            progress=JobProgress(
+                stage=JobStage.QUEUED,
+                completed=0,
+                total=1,
+                unit=JobProgressUnit.ITEMS,
+                current=None,
+                stage_started_at=now,
+                updated_at=now,
+            ),
+        ),
+        revision='revision-1',
+        candidate_ids=('candidate-1',),
+    )
 
 
 @pytest.mark.asyncio
@@ -390,6 +496,128 @@ async def test_repository_atomically_enqueues_claims_and_expires_leases(
     failed = await repository.get_job(claimed.job_id)
     assert failed is not None
     assert failed.state is JobState.FAILED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('repository_kind', ['memory', 'sqlite'])
+async def test_manager_recovers_queued_apply_and_persists_business_result(
+    tmp_path: Path,
+    repository_kind: str,
+) -> None:
+    repository = make_repository(repository_kind, tmp_path)
+    now = datetime.now(UTC)
+    queued = make_apply_job(now=now)
+    assert (await repository.enqueue_apply_job(queued, max_active=1)).record == queued
+    service = ControlledApplyService(repository=repository, result_state=ApplyState.FAILED)
+    manager = FillActorJobManager(
+        service=service,
+        repository=repository,
+        max_concurrent_jobs=1,
+        max_active_jobs=1,
+        poll_interval=0.01,
+    )
+
+    await manager.start()
+    completed = await wait_for_state(repository, queued.job.job_id, {JobState.COMPLETED})
+    stored = await repository.get_apply_job(queued.job.job_id)
+    await manager.aclose()
+
+    assert service.apply_calls == [('plan-1', 'revision-1', ('candidate-1',))]
+    assert not service.started.is_set()
+    assert completed.operation is JobOperation.APPLY
+    assert completed.progress is not None
+    assert completed.progress.completed == 1
+    assert completed.progress.total == 1
+    assert completed.progress.current is None
+    assert stored is not None
+    assert stored.result is not None
+    assert stored.result.state is ApplyState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_apply_job_rejects_cancel_and_shutdown_drains_current_move() -> None:
+    repository = MemoryFillActorRepository()
+    service = ControlledApplyService(repository=repository, block_apply=True)
+    manager = FillActorJobManager(
+        service=service,
+        repository=repository,
+        max_concurrent_jobs=1,
+        max_active_jobs=1,
+        poll_interval=0.01,
+    )
+    record = await manager.start_apply(
+        plan_id='plan-1',
+        revision='revision-1',
+        candidate_ids=['candidate-1'],
+        request_id='apply-request-0001',
+    )
+    await asyncio.wait_for(service.apply_started.wait(), timeout=1)
+
+    with pytest.raises(ApplyJobNotCancellableError):
+        await manager.cancel_plan(record.job.job_id)
+    closing = asyncio.create_task(manager.aclose())
+    await asyncio.sleep(0.02)
+    running = await repository.get_job(record.job.job_id)
+    assert not closing.done()
+    assert running is not None
+    assert running.state is JobState.RUNNING
+    assert running.error_code is None
+
+    service.apply_release.set()
+    await asyncio.wait_for(closing, timeout=1)
+    completed = await repository.get_apply_job(record.job.job_id)
+
+    assert completed is not None
+    assert completed.job.state is JobState.COMPLETED
+    assert completed.job.error_code is None
+    assert completed.result is not None
+    assert completed.result.results[0].state is MoveState.MOVED
+
+
+@pytest.mark.asyncio
+async def test_apply_job_ownership_loss_drains_only_current_candidate() -> None:
+    repository = OwnershipLossRepository()
+    service = ControlledApplyService(repository=repository, block_apply=True)
+    manager = FillActorJobManager(
+        service=service,
+        repository=repository,
+        max_concurrent_jobs=1,
+        max_active_jobs=1,
+        lease_duration=timedelta(milliseconds=150),
+        poll_interval=0.01,
+    )
+    record = await manager.start_apply(
+        plan_id='plan-1',
+        revision='revision-1',
+        candidate_ids=['candidate-1', 'candidate-2'],
+        request_id='apply-ownership-loss',
+    )
+    await asyncio.wait_for(service.apply_started.wait(), timeout=1)
+    running = await wait_for_state(repository, record.job.job_id, {JobState.RUNNING})
+    assert running.lease_expires_at is not None
+
+    assert (
+        await repository.fail_expired_jobs(
+            now=running.lease_expires_at + timedelta(seconds=1),
+            error_code='job_interrupted',
+        )
+        == 1
+    )
+    await asyncio.wait_for(repository.rejected_renewal.wait(), timeout=1)
+    await asyncio.sleep(0)
+    service.apply_release.set()
+    for _ in range(100):
+        if service.processed_candidates:
+            break
+        await asyncio.sleep(0.005)
+    await manager.aclose()
+
+    stored = await repository.get_apply_job(record.job.job_id)
+    assert service.processed_candidates == ['candidate-1']
+    assert stored is not None
+    assert stored.job.state is JobState.FAILED
+    assert stored.job.error_code == 'job_interrupted'
+    assert stored.result is None
 
 
 @pytest.mark.asyncio

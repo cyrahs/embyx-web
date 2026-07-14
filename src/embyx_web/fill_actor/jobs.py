@@ -7,12 +7,19 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
-from embyx_web.fill_actor.errors import FillActorError, JobQueueFullError
+from embyx_web.fill_actor.errors import (
+    ApplyJobNotCancellableError,
+    ApplyRequestConflictError,
+    FillActorError,
+    JobQueueFullError,
+)
 from embyx_web.fill_actor.feeds import RSSHubFeedWarmer
-from embyx_web.fill_actor.models import FillActorPlan, VideoState
+from embyx_web.fill_actor.models import ApplyResult, FillActorPlan, VideoState
 from embyx_web.fill_actor.persistence import (
+    ApplyJobRecord,
     CancelJobOutcome,
     CancelJobResult,
+    EnqueueApplyJobOutcome,
     FillActorRepository,
     JobFeedRecord,
     JobOperation,
@@ -82,6 +89,7 @@ class _OwnedProgressReporter:
             raise ValueError(msg)
         self._repository = repository
         self._job_id = job.job_id
+        self._operation = job.operation
         self._owner_id = owner_id
         self._clock = clock
         self._flush_interval = flush_interval
@@ -129,7 +137,13 @@ class _OwnedProgressReporter:
             else:
                 self._schedule_locked()
 
-    async def finish(self, state: JobState, *, error_code: str | None = None) -> bool:
+    async def finish(
+        self,
+        state: JobState,
+        *,
+        error_code: str | None = None,
+        apply_result: ApplyResult | None = None,
+    ) -> bool:
         timer: asyncio.Task[None] | None
         async with self._lock:
             if self._closed:
@@ -143,7 +157,7 @@ class _OwnedProgressReporter:
                 completed=self._current.completed,
                 total=self._current.total,
                 unit=self._current.unit,
-                current=self._current.current,
+                current=None if self._operation is JobOperation.APPLY else self._current.current,
                 stage_started_at=now,
                 updated_at=now,
             )
@@ -159,6 +173,7 @@ class _OwnedProgressReporter:
             error_code=error_code,
             now=now,
             progress=progress,
+            apply_result=apply_result,
         )
 
     async def mark_unowned(self) -> None:
@@ -295,8 +310,55 @@ class FillActorJobManager:
         self._wake.set()
         return job
 
+    async def start_apply(
+        self,
+        *,
+        plan_id: str,
+        revision: str,
+        candidate_ids: Sequence[str],
+        request_id: str,
+    ) -> ApplyJobRecord:
+        await self.start()
+        normalized = tuple(dict.fromkeys(candidate_ids))
+        now = self._now()
+        job = JobRecord(
+            job_id=request_id,
+            plan_id=plan_id,
+            operation=JobOperation.APPLY,
+            state=JobState.QUEUED,
+            created_at=now,
+            updated_at=now,
+            progress=JobProgress(
+                stage=JobStage.QUEUED,
+                completed=0,
+                total=len(normalized),
+                unit=JobProgressUnit.ITEMS,
+                current=None,
+                stage_started_at=now,
+                updated_at=now,
+            ),
+        )
+        record = ApplyJobRecord(job=job, revision=revision, candidate_ids=normalized)
+        enqueued = await self._repository.enqueue_apply_job(
+            record,
+            max_active=self._max_active_jobs,
+        )
+        if enqueued.outcome is EnqueueApplyJobOutcome.FULL:
+            raise JobQueueFullError(str(self._max_active_jobs))
+        if enqueued.outcome is EnqueueApplyJobOutcome.CONFLICT:
+            raise ApplyRequestConflictError(request_id)
+        if enqueued.record is None:  # pragma: no cover - repository outcome invariant
+            msg = 'enqueued apply job must return its record'
+            raise RuntimeError(msg)
+        if enqueued.outcome is EnqueueApplyJobOutcome.ENQUEUED:
+            self._wake.set()
+        return enqueued.record
+
     async def get_job(self, plan_id: str) -> JobRecord | None:
         return await self._repository.get_job(plan_id)
+
+    async def get_apply_job(self, job_id: str) -> ApplyJobRecord | None:
+        return await self._repository.get_apply_job(job_id)
 
     async def get_plan(self, plan_id: str) -> FillActorPlan | None:
         job = await self._repository.get_job(plan_id)
@@ -315,7 +377,10 @@ class FillActorJobManager:
         )
         self._cancel_operations.add(operation)
         operation.add_done_callback(self._cancel_operation_done)
-        return await asyncio.shield(operation)
+        result = await asyncio.shield(operation)
+        if result.outcome is CancelJobOutcome.NOT_CANCELLABLE:
+            raise ApplyJobNotCancellableError(plan_id)
+        return result
 
     async def recover_interrupted_jobs(self) -> int:
         return await self._repository.fail_expired_jobs(now=self._now(), error_code='job_interrupted')
@@ -370,10 +435,8 @@ class FillActorJobManager:
     async def _run_claimed_job(self, job: JobRecord) -> None:
         execution = _JobExecution(job_id=job.job_id)
         self._executions[job.job_id] = execution
-        task = asyncio.create_task(
-            self._run_plan(job, execution),
-            name=f'fill-actor-plan-{job.job_id}',
-        )
+        runner = self._run_apply if job.operation is JobOperation.APPLY else self._run_plan
+        task = asyncio.create_task(runner(job, execution), name=f'fill-actor-{job.operation.value}-{job.job_id}')
         execution.attach_task(task)
         try:
             await task
@@ -388,6 +451,99 @@ class FillActorJobManager:
         finally:
             if self._executions.get(job.job_id) is execution:
                 self._executions.pop(job.job_id, None)
+
+    async def _run_apply(self, job: JobRecord, execution: _JobExecution) -> None:  # noqa: C901
+        reporter = _OwnedProgressReporter(
+            repository=self._repository,
+            job=job,
+            owner_id=self._owner_id,
+            clock=self._now,
+            flush_interval=self._progress_flush_interval,
+        )
+        heartbeat: asyncio.Task[None] | None = None
+        apply_task: asyncio.Task[ApplyResult] | None = None
+        try:
+            if not await self._revalidate_claim(job):
+                await reporter.mark_unowned()
+                return
+            if not await self._service.apply_ready():
+                await self._finish_terminal(reporter, JobState.FAILED, error_code='not_ready')
+                return
+            stored = await self._repository.get_apply_job(job.job_id)
+            if stored is None or stored.job.plan_id is None:
+                await self._finish_terminal(reporter, JobState.FAILED, error_code='apply_job_payload_missing')
+                return
+            heartbeat = asyncio.create_task(self._heartbeat(job, reporter, execution))
+            apply_task = asyncio.create_task(
+                self._service.apply(
+                    plan_id=stored.job.plan_id,
+                    revision=stored.revision,
+                    candidate_ids=stored.candidate_ids,
+                    progress=reporter,
+                    stop_requested=lambda: execution.stop_reason is not None,
+                ),
+                name=f'fill-actor-apply-work-{job.job_id}',
+            )
+            result = await asyncio.shield(apply_task)
+            await self._stop_heartbeat(heartbeat)
+            heartbeat = None
+            saved = await self._finish_terminal(
+                reporter,
+                JobState.COMPLETED,
+                apply_result=result,
+            )
+            if not saved:
+                LOGGER.warning('apply job %s completed after its lease was lost', job.job_id)
+        except asyncio.CancelledError:
+            cleanup = asyncio.create_task(
+                self._cleanup_stopped_apply(job, execution, reporter, heartbeat, apply_task),
+                name=f'fill-actor-apply-cleanup-{job.job_id}',
+            )
+            await self._wait_managed_task(cleanup)
+            if execution.stop_reason in {_ExecutionStopReason.USER_CANCEL, _ExecutionStopReason.OWNERSHIP_LOST}:
+                return
+            if execution.stop_reason is None:
+                return
+            raise
+        except FillActorError as exc:
+            if heartbeat is not None:
+                await self._stop_heartbeat(heartbeat)
+            await self._finish_terminal(reporter, JobState.FAILED, error_code=exc.code)
+        except Exception:
+            LOGGER.exception('fill-actor apply job failed unexpectedly')
+            if heartbeat is not None:
+                await self._stop_heartbeat(heartbeat)
+            await self._finish_terminal(reporter, JobState.FAILED, error_code='apply_failed')
+
+    async def _cleanup_stopped_apply(
+        self,
+        job: JobRecord,
+        execution: _JobExecution,
+        reporter: _OwnedProgressReporter,
+        heartbeat: asyncio.Task[None] | None,
+        apply_task: asyncio.Task[ApplyResult] | None,
+    ) -> None:
+        result: ApplyResult | None = None
+        if apply_task is not None:
+            try:
+                result = await self._wait_managed_result(apply_task)
+            except asyncio.CancelledError:
+                pass
+            except FillActorError:
+                pass
+            except Exception:
+                LOGGER.exception('stopped apply job failed while its active move was draining')
+        if heartbeat is not None:
+            await self._stop_heartbeat(heartbeat)
+        if execution.stop_reason in {_ExecutionStopReason.USER_CANCEL, _ExecutionStopReason.OWNERSHIP_LOST}:
+            await reporter.mark_unowned()
+            return
+        stored = await self._repository.get_apply_job(job.job_id)
+        completed_all = stored is not None and result is not None and len(result.results) == len(stored.candidate_ids)
+        if completed_all:
+            await self._finish_terminal(reporter, JobState.COMPLETED, apply_result=result)
+        else:
+            await self._finish_terminal(reporter, JobState.FAILED, error_code='job_interrupted')
 
     async def _run_plan(self, job: JobRecord, execution: _JobExecution) -> None:
         reporter = _OwnedProgressReporter(
@@ -636,6 +792,15 @@ class FillActorJobManager:
                 continue
         task.result()
 
+    @staticmethod
+    async def _wait_managed_result[ResultT](task: asyncio.Task[ResultT]) -> ResultT:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+        return task.result()
+
     async def _reaper_loop(self) -> None:
         interval = max(self._lease_duration.total_seconds() / 3, self._poll_interval)
         while True:
@@ -653,9 +818,10 @@ class FillActorJobManager:
         state: JobState,
         *,
         error_code: str | None = None,
+        apply_result: ApplyResult | None = None,
     ) -> bool:
         try:
-            return await reporter.finish(state, error_code=error_code)
+            return await reporter.finish(state, error_code=error_code, apply_result=apply_result)
         except Exception:
             LOGGER.exception('fill-actor terminal job update failed')
             return False

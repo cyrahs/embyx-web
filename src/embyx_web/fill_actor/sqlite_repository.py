@@ -7,15 +7,18 @@ from datetime import datetime
 from pathlib import Path
 
 from embyx_web.fill_actor.cloud_moves import CloudFileMetadata
-from embyx_web.fill_actor.models import FillActorPlan, MoveResult
+from embyx_web.fill_actor.models import ApplyResult, FillActorPlan, MoveResult
 from embyx_web.fill_actor.persistence import (
     JOB_CANCELLED_ERROR_CODE,
+    ApplyJobRecord,
     CancelJobOutcome,
     CancelJobResult,
     CandidateKind,
     CandidateRecord,
     CloudMoveOperationRecord,
     CloudMoveOperationState,
+    EnqueueApplyJobOutcome,
+    EnqueueApplyJobResult,
     FileFingerprint,
     JobFeedErrorCode,
     JobFeedRecord,
@@ -34,7 +37,7 @@ from embyx_web.fill_actor.persistence import (
     validate_journal_transition,
 )
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 
 async def _run_sync[ResultT](function: Callable[..., ResultT], *args: object) -> ResultT:
@@ -218,6 +221,17 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
         WHERE state IN ('prepared', 'submitting', 'verifying', 'unknown')
         """,
     ),
+    6: (
+        """
+        CREATE TABLE apply_jobs (
+            job_id TEXT PRIMARY KEY,
+            revision TEXT NOT NULL CHECK (length(revision) > 0),
+            candidate_ids_json TEXT NOT NULL,
+            result_json TEXT,
+            FOREIGN KEY (job_id) REFERENCES jobs (job_id) ON DELETE CASCADE
+        )
+        """,
+    ),
 }
 
 
@@ -263,6 +277,17 @@ class SQLiteFillActorRepository:
     ) -> bool:
         return await _run_sync(self._enqueue_job, record, max_active, feeds)
 
+    async def enqueue_apply_job(
+        self,
+        record: ApplyJobRecord,
+        *,
+        max_active: int,
+    ) -> EnqueueApplyJobResult:
+        return await _run_sync(self._enqueue_apply_job, record, max_active)
+
+    async def get_apply_job(self, job_id: str) -> ApplyJobRecord | None:
+        return await _run_sync(self._get_apply_job, job_id)
+
     async def claim_next_job(
         self,
         *,
@@ -301,8 +326,18 @@ class SQLiteFillActorRepository:
         error_code: str | None,
         now: datetime,
         progress: JobProgress,
+        apply_result: ApplyResult | None = None,
     ) -> bool:
-        return await _run_sync(self._finish_owned_job, job_id, owner_id, state, error_code, now, progress)
+        return await _run_sync(
+            self._finish_owned_job,
+            job_id,
+            owner_id,
+            state,
+            error_code,
+            now,
+            progress,
+            apply_result,
+        )
 
     async def cancel_job(self, *, job_id: str, now: datetime) -> CancelJobResult:
         return await _run_sync(self._cancel_job, job_id, now)
@@ -526,7 +561,15 @@ class SQLiteFillActorRepository:
                 """,
                 (plan_id,),
             ).fetchone()
-            if unreconciled is not None or unresolved_cloud is not None:
+            active_apply = connection.execute(
+                """
+                SELECT 1 FROM jobs
+                WHERE plan_id = ? AND operation = 'apply' AND state IN ('queued', 'running')
+                LIMIT 1
+                """,
+                (plan_id,),
+            ).fetchone()
+            if unreconciled is not None or unresolved_cloud is not None or active_apply is not None:
                 return False
             connection.execute('UPDATE jobs SET plan_id = NULL WHERE plan_id = ?', (plan_id,))
             cursor = connection.execute('DELETE FROM plans WHERE plan_id = ?', (plan_id,))
@@ -548,6 +591,12 @@ class SQLiteFillActorRepository:
                       SELECT 1 FROM cloud_move_operations
                       WHERE cloud_move_operations.plan_id = plans.plan_id
                         AND cloud_move_operations.state NOT IN ('succeeded', 'conflict', 'failed')
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM jobs
+                      WHERE jobs.plan_id = plans.plan_id
+                        AND jobs.operation = 'apply'
+                        AND jobs.state IN ('queued', 'running')
                   )
                 """,
                 (_datetime_to_text(now),),
@@ -639,6 +688,64 @@ class SQLiteFillActorRepository:
                 ),
             )
             return True
+
+    def _enqueue_apply_job(
+        self,
+        record: ApplyJobRecord,
+        max_active: int,
+    ) -> EnqueueApplyJobResult:
+        with closing(self._connect()) as connection, connection:
+            connection.execute('BEGIN IMMEDIATE')
+            existing_row = connection.execute(
+                """
+                SELECT jobs.*, apply_jobs.revision, apply_jobs.candidate_ids_json, apply_jobs.result_json
+                FROM jobs LEFT JOIN apply_jobs ON apply_jobs.job_id = jobs.job_id
+                WHERE jobs.job_id = ?
+                """,
+                (record.job.job_id,),
+            ).fetchone()
+            if existing_row is not None:
+                if (
+                    existing_row['revision'] is not None
+                    and existing_row['plan_id'] == record.job.plan_id
+                    and existing_row['revision'] == record.revision
+                    and tuple(json.loads(existing_row['candidate_ids_json'])) == record.candidate_ids
+                ):
+                    return EnqueueApplyJobResult(
+                        EnqueueApplyJobOutcome.EXISTING,
+                        _apply_job_from_row(existing_row),
+                    )
+                return EnqueueApplyJobResult(EnqueueApplyJobOutcome.CONFLICT, None)
+
+            active = connection.execute("SELECT COUNT(*) FROM jobs WHERE state IN ('queued', 'running')").fetchone()[0]
+            if active >= max_active:
+                return EnqueueApplyJobResult(EnqueueApplyJobOutcome.FULL, None)
+            self._execute_save_job(connection, record.job)
+            connection.execute(
+                """
+                INSERT INTO apply_jobs (job_id, revision, candidate_ids_json, result_json)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    record.job.job_id,
+                    record.revision,
+                    json.dumps(record.candidate_ids),
+                    record.result.model_dump_json() if record.result is not None else None,
+                ),
+            )
+            return EnqueueApplyJobResult(EnqueueApplyJobOutcome.ENQUEUED, record)
+
+    def _get_apply_job(self, job_id: str) -> ApplyJobRecord | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT jobs.*, apply_jobs.revision, apply_jobs.candidate_ids_json, apply_jobs.result_json
+                FROM apply_jobs JOIN jobs ON jobs.job_id = apply_jobs.job_id
+                WHERE apply_jobs.job_id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+        return _apply_job_from_row(row) if row is not None else None
 
     def _claim_next_job(
         self,
@@ -732,8 +839,10 @@ class SQLiteFillActorRepository:
         error_code: str | None,
         now: datetime,
         progress: JobProgress,
+        apply_result: ApplyResult | None,
     ) -> bool:
         with closing(self._connect()) as connection, connection:
+            connection.execute('BEGIN IMMEDIATE')
             cursor = connection.execute(
                 """
                 UPDATE jobs SET
@@ -753,7 +862,34 @@ class SQLiteFillActorRepository:
                     _datetime_to_text(now),
                 ),
             )
-            return cursor.rowcount == 1
+            if cursor.rowcount != 1:
+                return False
+            if apply_result is not None:
+                apply_row = connection.execute(
+                    """
+                    SELECT jobs.*, apply_jobs.revision, apply_jobs.candidate_ids_json, apply_jobs.result_json
+                    FROM apply_jobs JOIN jobs ON jobs.job_id = apply_jobs.job_id
+                    WHERE apply_jobs.job_id = ?
+                    """,
+                    (job_id,),
+                ).fetchone()
+                if apply_row is None:
+                    msg = 'apply result requires an apply job'
+                    raise ValueError(msg)
+                ApplyJobRecord(
+                    job=_job_from_row(apply_row),
+                    revision=apply_row['revision'],
+                    candidate_ids=tuple(json.loads(apply_row['candidate_ids_json'])),
+                    result=apply_result,
+                )
+                result_cursor = connection.execute(
+                    'UPDATE apply_jobs SET result_json = ? WHERE job_id = ?',
+                    (apply_result.model_dump_json(), job_id),
+                )
+                if result_cursor.rowcount != 1:
+                    msg = 'apply result update was not atomic'
+                    raise ValueError(msg)
+            return True
 
     def _cancel_job(self, job_id: str, now: datetime) -> CancelJobResult:
         with closing(self._connect()) as connection, connection:
@@ -763,6 +899,13 @@ class SQLiteFillActorRepository:
                 return CancelJobResult(CancelJobOutcome.NOT_FOUND, None)
 
             current = _job_from_row(row)
+            if current.operation is JobOperation.APPLY:
+                return CancelJobResult(
+                    CancelJobOutcome.NOT_CANCELLABLE,
+                    current,
+                    previous_state=current.state,
+                    previous_owner_id=current.owner_id,
+                )
             if current.state is JobState.FAILED and current.error_code == JOB_CANCELLED_ERROR_CODE:
                 return CancelJobResult(
                     CancelJobOutcome.ALREADY_CANCELLED,
@@ -832,7 +975,9 @@ class SQLiteFillActorRepository:
                 """
                 UPDATE jobs
                 SET state = 'failed', updated_at = ?, error_code = ?, owner_id = NULL, lease_expires_at = NULL,
-                    progress_stage = 'done', progress_stage_started_at = ?, progress_updated_at = ?
+                    progress_stage = 'done',
+                    progress_current = CASE WHEN operation = 'apply' THEN NULL ELSE progress_current END,
+                    progress_stage_started_at = ?, progress_updated_at = ?
                 WHERE job_id = ? AND state = 'running'
                 """,
                 (
@@ -1249,6 +1394,16 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
     )
 
 
+def _apply_job_from_row(row: sqlite3.Row) -> ApplyJobRecord:
+    result_json = row['result_json']
+    return ApplyJobRecord(
+        job=_job_from_row(row),
+        revision=row['revision'],
+        candidate_ids=tuple(json.loads(row['candidate_ids_json'])),
+        result=ApplyResult.model_validate_json(result_json) if result_json is not None else None,
+    )
+
+
 def _job_feed_from_row(row: sqlite3.Row) -> JobFeedRecord:
     return JobFeedRecord(
         job_id=row['job_id'],
@@ -1280,7 +1435,7 @@ def _terminal_progress(record: JobRecord, now: datetime) -> JobProgress:
         completed=progress.completed,
         total=progress.total,
         unit=progress.unit,
-        current=progress.current,
+        current=None if record.operation is JobOperation.APPLY else progress.current,
         stage_started_at=now,
         updated_at=now,
     )

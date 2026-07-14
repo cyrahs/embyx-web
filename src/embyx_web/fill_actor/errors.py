@@ -20,6 +20,18 @@ class JobQueueFullError(FillActorError):
     code = 'job_queue_full'
 
 
+class ApplyRequestConflictError(FillActorError):
+    code = 'apply_request_conflict'
+
+
+class ApplyJobNotCancellableError(FillActorError):
+    code = 'apply_job_not_cancellable'
+
+
+class UnknownApplyJobError(FillActorError):
+    code = 'unknown_apply_job'
+
+
 class MoveDisabledError(FillActorError):
     code = 'move_disabled'
 
