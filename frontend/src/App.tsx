@@ -1,19 +1,24 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   ApiError,
-  applyCandidates,
   cancelPlan,
   createPlan,
+  getActiveApplyRequest,
   getActivePlanId,
+  getApplyJob,
   getHealth,
   getPlan,
   hasApiToken,
+  setActiveApplyRequest,
   setActivePlanId,
   setApiToken as storeApiToken,
+  startApplyJob,
   type HealthStatus,
 } from './api'
 import type {
+  ActiveApplyRequest,
   ActorFeedStatus,
+  ApplyJobEnvelope,
   ApplyResult,
   FillActorPlan,
   JobProgress,
@@ -204,8 +209,17 @@ function durationText(rawSeconds: number): string {
   return `${hours} 小时 ${minutes % 60} 分`
 }
 
-function stageElapsed(progress: JobProgress | null | undefined, now: number): number | null {
+function stageElapsed(progress: JobProgress | null | undefined, now: number, pending = true): number | null {
   if (!progress) return null
+  if (!pending) {
+    const elapsed = safeSeconds(progress.elapsed_seconds)
+    if (elapsed !== null) return elapsed
+    const startedAt = progress.stage_started_at ? Date.parse(progress.stage_started_at) : Number.NaN
+    const updatedAt = progress.updated_at ? Date.parse(progress.updated_at) : Number.NaN
+    return Number.isFinite(startedAt) && Number.isFinite(updatedAt)
+      ? Math.max(0, Math.floor((updatedAt - startedAt) / 1000))
+      : null
+  }
   const fromStart = secondsSince(progress.stage_started_at, now)
   if (fromStart !== null) return fromStart
   const elapsed = safeSeconds(progress.elapsed_seconds)
@@ -222,17 +236,80 @@ function lastProgressAge(progress: JobProgress | null | undefined, now: number):
   return secondsSince(progress.updated_at, now) ?? safeSeconds(progress.last_progress_seconds)
 }
 
-function progressCount(progress: JobProgress | null | undefined): string | null {
+function progressCount(progress: JobProgress | null | undefined, kind: 'scan' | 'apply' = 'scan'): string | null {
   const completed = safeSeconds(progress?.completed)
   if (completed === null) return null
   const count = Math.floor(completed)
   const total = safeSeconds(progress?.total)
+  if (kind === 'apply') return total === null
+    ? `已处理 ${count} 个文件`
+    : `${count} / ${Math.floor(total)} 个文件`
   const unit = progress?.unit ? (UNIT_LABELS[progress.unit] ?? progress.unit) : '项'
   return total === null ? `已完成 ${count} ${unit}` : `${count} / ${Math.floor(total)} ${unit}`
 }
 
+function createApplyRequestId(): string {
+  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID()
+  const bytes = crypto.getRandomValues(new Uint8Array(16))
+  return [...bytes].map((value) => value.toString(16).padStart(2, '0')).join('')
+}
+
+function applyPlaceholder(request: ActiveApplyRequest): PlanJob {
+  return {
+    job_id: request.jobId ?? request.requestId,
+    plan_id: request.planId,
+    operation: 'apply',
+    state: 'queued',
+    progress: {
+      stage: 'queued',
+      completed: 0,
+      total: request.candidateIds.length,
+      unit: 'items',
+      percent: 0,
+      current: null,
+    },
+  }
+}
+
+function terminalApplyJob(job: PlanJob, candidateCount: number): PlanJob {
+  const total = candidateCount
+  return {
+    ...job,
+    state: 'completed',
+    progress: {
+      ...job.progress,
+      completed: total,
+      total,
+      unit: job.progress?.unit ?? 'items',
+      current: null,
+      percent: 100,
+    },
+  }
+}
+
+function publicFileName(value: string): string {
+  const parts = value.trim().split(/[\\/]/)
+  return parts.at(-1) || '当前文件'
+}
+
+function assertActiveApplyEnvelope(envelope: ApplyJobEnvelope, request: ActiveApplyRequest): void {
+  const responsePlanId = envelope.job.plan_id ?? envelope.result?.plan_id ?? null
+  if (responsePlanId !== request.planId || (envelope.result && envelope.result.revision !== request.revision)) {
+    throw new ApiError(0, 'invalid_apply_job_response', '移动任务响应与当前计划不匹配，请稍后重试。')
+  }
+  if (envelope.result) {
+    const expected = new Set(request.candidateIds)
+    const actual = new Set(envelope.result.results.map((result) => result.candidate_id))
+    if (expected.size !== actual.size || [...expected].some((candidateId) => !actual.has(candidateId))) {
+      throw new ApiError(0, 'invalid_apply_job_response', '移动任务结果与已确认文件不匹配，请稍后重试。')
+    }
+  }
+}
+
 export default function App() {
-  const [recoveredPlanId] = useState(getActivePlanId)
+  const [recoveredScanPlanId] = useState(getActivePlanId)
+  const [recoveredApply] = useState(getActiveApplyRequest)
+  const recoveredPlanId = recoveredScanPlanId ?? recoveredApply?.planId ?? null
   const [input, setInput] = useState('')
   const [apiTokenInput, setApiTokenInput] = useState('')
   const [authRequired, setAuthRequired] = useState(false)
@@ -242,8 +319,8 @@ export default function App() {
   const [plan, setPlan] = useState<FillActorPlan | null>(null)
   const [feeds, setFeeds] = useState<ActorFeedStatus[]>([])
   const [planId, setPlanId] = useState<string | null>(recoveredPlanId)
-  const [job, setJob] = useState<PlanJob | null>(() => recoveredPlanId
-    ? { plan_id: recoveredPlanId, state: 'running' }
+  const [job, setJob] = useState<PlanJob | null>(() => recoveredScanPlanId
+    ? { plan_id: recoveredScanPlanId, operation: 'create_plan', state: 'running' }
     : null)
   const [submitting, setSubmitting] = useState(false)
   const [cancelling, setCancelling] = useState(false)
@@ -251,18 +328,28 @@ export default function App() {
   const [pollWarning, setPollWarning] = useState<string | null>(null)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [confirmOpen, setConfirmOpen] = useState(false)
-  const [applying, setApplying] = useState(false)
+  const [activeApply, setActiveApply] = useState<ActiveApplyRequest | null>(recoveredApply)
+  const [applyJob, setApplyJob] = useState<PlanJob | null>(() => recoveredApply ? applyPlaceholder(recoveredApply) : null)
   const [applyResult, setApplyResult] = useState<ApplyResult | null>(null)
+  const [applyPollWarning, setApplyPollWarning] = useState<string | null>(null)
+  const [applyPausedForAuth, setApplyPausedForAuth] = useState(false)
+  const [applyRetryTick, setApplyRetryTick] = useState(0)
+  const [applyPlanRetryTick, setApplyPlanRetryTick] = useState(0)
   const [needsFreshPlan, setNeedsFreshPlan] = useState(false)
   const [copyingMagnets, setCopyingMagnets] = useState(false)
   const [copiedRevision, setCopiedRevision] = useState<string | null>(null)
   const [magnetCopyError, setMagnetCopyError] = useState<string | null>(null)
   const [now, setNow] = useState(Date.now())
-  const lastAutoSelectedRevision = useRef<string | null>(null)
+  const lastAutoSelectedPlanKey = useRef<string | null>(null)
   const pollFailures = useRef(0)
   const requestGeneration = useRef(0)
+  const applyPollFailures = useRef(0)
+  const applyGeneration = useRef(0)
+  const applyPlanGeneration = useRef(0)
   const activePollController = useRef<AbortController | null>(null)
   const activeCancelController = useRef<AbortController | null>(null)
+  const activeApplyController = useRef<AbortController | null>(null)
+  const activeApplyPlanController = useRef<AbortController | null>(null)
   const parsed = useMemo(() => parseActorIds(input), [input])
   const candidates = useMemo(() => candidateMap(plan), [plan])
   const magnets = useMemo(() => planMagnets(plan), [plan])
@@ -272,6 +359,7 @@ export default function App() {
     applyResult?.results.some((item) => item.error_code === 'cloud_move_status_unknown'),
   )
   const jobPending = isJobPending(job)
+  const applyPending = Boolean(activeApply && isJobPending(applyJob))
   const jobCancelled = isJobCancelled(job)
   const feedsPending = feeds.some((feed) => feed.state === 'queued' || feed.state === 'warming')
   const envelopePending = jobPending || feedsPending
@@ -321,9 +409,9 @@ export default function App() {
 
   useEffect(() => {
     setNow(Date.now())
-    const timer = window.setInterval(() => setNow(Date.now()), jobPending ? 1_000 : 30_000)
+    const timer = window.setInterval(() => setNow(Date.now()), jobPending || applyPending ? 1_000 : 30_000)
     return () => window.clearInterval(timer)
-  }, [jobPending])
+  }, [applyPending, jobPending])
 
   useEffect(() => {
     if (planId && envelopePending) setActivePlanId(planId)
@@ -331,13 +419,23 @@ export default function App() {
   }, [envelopePending, job, plan, planId])
 
   useEffect(() => {
-    if (!plan || lastAutoSelectedRevision.current === plan.revision) return
-    lastAutoSelectedRevision.current = plan.revision
+    if (!plan) return
+    const planKey = `${plan.plan_id}:${plan.revision}`
+    if (lastAutoSelectedPlanKey.current === planKey) return
+    lastAutoSelectedPlanKey.current = planKey
     const safeIds = plan.videos.flatMap((video) =>
       video.move_candidates.filter((candidate) => !candidate.destination_conflict).map((candidate) => candidate.candidate_id),
     )
-    setSelected(new Set(safeIds))
-  }, [plan])
+    const safeIdSet = new Set(safeIds)
+    const recoveredIds = activeApply?.planId === plan.plan_id
+      ? activeApply.revision === plan.revision ? activeApply.candidateIds : []
+      : applyResult?.plan_id === plan.plan_id
+        ? applyResult.revision === plan.revision
+          ? applyResult.results.map((result) => result.candidate_id)
+          : []
+        : null
+    setSelected(new Set(recoveredIds === null ? safeIds : recoveredIds.filter((candidateId) => safeIdSet.has(candidateId))))
+  }, [activeApply, applyResult, plan])
 
   useEffect(() => {
     if (!planId || (!isJobPending(job) && !feedsPending) || cancelling) return
@@ -376,14 +474,195 @@ export default function App() {
     }
   }, [cancelling, feedsPending, job, planId])
 
+  useEffect(() => {
+    if (!activeApply || applyPausedForAuth) return
+    const generation = applyGeneration.current
+    const controller = new AbortController()
+    activeApplyController.current = controller
+    const delay = activeApply.jobId || applyPollFailures.current > 0
+      ? Math.min(800 * 2 ** applyPollFailures.current, 10_000)
+      : 0
+    const timer = window.setTimeout(() => {
+      if (!activeApply.jobId) {
+        setActiveApplyRequest({
+          ...activeApply,
+          jobId: activeApply.requestId,
+          retrySubmitIfMissing: true,
+        })
+      }
+      const pendingRequest = activeApply.jobId
+        ? getApplyJob(activeApply.jobId, controller.signal)
+        : startApplyJob(
+            activeApply.planId,
+            activeApply.revision,
+            activeApply.candidateIds,
+            activeApply.requestId,
+            controller.signal,
+          )
+      void pendingRequest
+        .then((envelope: ApplyJobEnvelope) => {
+          if (generation !== applyGeneration.current) return
+          const responseJobId = envelope.job.job_id ?? envelope.job.id
+          if (!responseJobId || (envelope.job.operation && envelope.job.operation !== 'apply')) {
+            throw new ApiError(0, 'invalid_apply_job_response', '移动任务响应无效，请稍后重试。')
+          }
+          assertActiveApplyEnvelope(envelope, activeApply)
+          applyPollFailures.current = 0
+          setApplyPollWarning(null)
+          setApplyPausedForAuth(false)
+          setError(null)
+
+          if (envelope.result) {
+            const finalJob = terminalApplyJob(envelope.job, activeApply.candidateIds.length)
+            setApplyJob(finalJob)
+            setApplyResult(envelope.result)
+            if (envelope.result.results.some((item) => item.state === 'stale')) setNeedsFreshPlan(true)
+            setActiveApplyRequest(null)
+            setActiveApply(null)
+            return
+          }
+
+          const state = jobState(envelope.job)
+          setApplyJob(envelope.job)
+          if (!isJobPending(envelope.job)) {
+            if (envelope.job.error_code && STALE_CODES.has(envelope.job.error_code)) setNeedsFreshPlan(true)
+            if (envelope.job.error_code === 'move_disabled') {
+              setHealth((current) => current ? { ...current, apply_enabled: false, apply_ready: false } : current)
+            }
+            setError(envelope.job.error_code
+              ? `移动任务失败：${envelope.job.error_code}`
+              : state === 'completed'
+                ? '移动任务已完成，但结果响应无效。'
+                : '移动任务未能完成。')
+            setActiveApplyRequest(null)
+            setActiveApply(null)
+            return
+          }
+
+          if (activeApply.jobId !== responseJobId || activeApply.retrySubmitIfMissing) {
+            const accepted = { ...activeApply, jobId: responseJobId, retrySubmitIfMissing: false }
+            setActiveApplyRequest(accepted)
+            setActiveApply(accepted)
+          } else {
+            setApplyRetryTick((value) => value + 1)
+          }
+        })
+        .catch((pollError: unknown) => {
+          if (generation !== applyGeneration.current) return
+          if (pollError instanceof DOMException && pollError.name === 'AbortError') return
+          if (pollError instanceof ApiError && pollError.code === 'unauthorized') {
+            setAuthRequired(true)
+            setApplyPausedForAuth(true)
+            setApplyPollWarning('移动任务仍在保留中；配置 API Token 后会继续恢复。')
+            return
+          }
+          if (
+            activeApply.jobId &&
+            activeApply.retrySubmitIfMissing &&
+            pollError instanceof ApiError &&
+            pollError.status === 404
+          ) {
+            const retryRequest = { ...activeApply }
+            delete retryRequest.jobId
+            delete retryRequest.retrySubmitIfMissing
+            setActiveApplyRequest(retryRequest)
+            setActiveApply(retryRequest)
+            return
+          }
+          if (pollError instanceof ApiError && STALE_CODES.has(pollError.code)) setNeedsFreshPlan(true)
+          if (pollError instanceof ApiError && pollError.code === 'move_disabled') {
+            setHealth((current) => current ? { ...current, apply_enabled: false, apply_ready: false } : current)
+          }
+          const retryable = !(pollError instanceof ApiError) || pollError.status === 0 || pollError.status >= 500
+          if (retryable) {
+            applyPollFailures.current += 1
+            setApplyPollWarning('暂时无法刷新移动任务状态，将自动重试。')
+            if (!activeApply.jobId) {
+              const recoveryRequest = {
+                ...activeApply,
+                jobId: activeApply.requestId,
+                retrySubmitIfMissing: true,
+              }
+              setActiveApplyRequest(recoveryRequest)
+              setActiveApply(recoveryRequest)
+            } else {
+              setApplyRetryTick((value) => value + 1)
+            }
+            return
+          }
+          setError(errorMessage(pollError))
+          setActiveApplyRequest(null)
+          setActiveApply(null)
+        })
+    }, delay)
+    return () => {
+      window.clearTimeout(timer)
+      controller.abort()
+      if (activeApplyController.current === controller) activeApplyController.current = null
+    }
+  }, [activeApply, applyPausedForAuth, applyRetryTick])
+
+  useEffect(() => {
+    const targetPlanId = activeApply?.planId ?? applyResult?.plan_id ?? (applyResult ? applyJob?.plan_id : null)
+    const targetRevision = activeApply?.revision ?? applyResult?.revision ?? null
+    if (
+      !targetPlanId ||
+      (plan?.plan_id === targetPlanId && (targetRevision === null || plan.revision === targetRevision))
+    ) return
+    const generation = applyPlanGeneration.current + 1
+    applyPlanGeneration.current = generation
+    const controller = new AbortController()
+    activeApplyPlanController.current = controller
+    const timer = window.setTimeout(() => {
+      void getPlan(targetPlanId, controller.signal)
+        .then((envelope) => {
+          if (generation !== applyPlanGeneration.current) return
+          if (
+            !envelope.plan ||
+            envelope.plan.plan_id !== targetPlanId ||
+            (targetRevision !== null && envelope.plan.revision !== targetRevision)
+          ) {
+            throw new ApiError(0, 'invalid_plan_response', '无法恢复移动任务对应的扫描结果。')
+          }
+          setPlan(envelope.plan)
+          setPlanId(envelope.planId ?? targetPlanId)
+          setFeeds(envelope.feeds)
+          setApplyPlanRetryTick(0)
+        })
+        .catch((recoveryError: unknown) => {
+          if (generation !== applyPlanGeneration.current) return
+          if (recoveryError instanceof DOMException && recoveryError.name === 'AbortError') return
+          const retryable = recoveryError instanceof ApiError && (
+            recoveryError.code === 'network_error' || recoveryError.status >= 500
+          )
+          if (retryable) {
+            setApplyPlanRetryTick((value) => value + 1)
+            return
+          }
+          if (recoveryError instanceof ApiError && recoveryError.code === 'unauthorized') setAuthRequired(true)
+          setError(errorMessage(recoveryError))
+        })
+    }, applyPlanRetryTick ? Math.min(800 * 2 ** applyPlanRetryTick, 10_000) : 0)
+    return () => {
+      window.clearTimeout(timer)
+      controller.abort()
+      if (activeApplyPlanController.current === controller) activeApplyPlanController.current = null
+      if (applyPlanGeneration.current === generation) applyPlanGeneration.current += 1
+    }
+  }, [activeApply, applyJob?.plan_id, applyPlanRetryTick, applyResult, plan])
+
   useEffect(() => () => {
     requestGeneration.current += 1
+    applyGeneration.current += 1
+    applyPlanGeneration.current += 1
     activePollController.current?.abort()
     activeCancelController.current?.abort()
+    activeApplyController.current?.abort()
+    activeApplyPlanController.current?.abort()
   }, [])
 
   async function startScan() {
-    if (!parsed.actorIds.length || parsed.invalid.length || parsed.actorIds.length > MAX_ACTORS) return
+    if (applyPending || !parsed.actorIds.length || parsed.invalid.length || parsed.actorIds.length > MAX_ACTORS) return
     setSubmitting(true)
     setCancelling(false)
     setError(null)
@@ -393,16 +672,26 @@ export default function App() {
     setFeeds([])
     setPlanId(null)
     setJob(null)
+    setActiveApplyRequest(null)
+    setActiveApply(null)
+    setApplyJob(null)
     setApplyResult(null)
+    setApplyPollWarning(null)
+    setApplyPausedForAuth(false)
     setSelected(new Set())
     setNeedsFreshPlan(false)
     setCopiedRevision(null)
     setMagnetCopyError(null)
-    lastAutoSelectedRevision.current = null
+    lastAutoSelectedPlanKey.current = null
     pollFailures.current = 0
+    setApplyPlanRetryTick(0)
     requestGeneration.current += 1
+    applyGeneration.current += 1
+    applyPlanGeneration.current += 1
     activePollController.current?.abort()
     activeCancelController.current?.abort()
+    activeApplyController.current?.abort()
+    activeApplyPlanController.current?.abort()
     try {
       consumeEnvelope(await createPlan(parsed.actorIds), setPlan, setPlanId, setJob, setFeeds, setError)
     } catch (scanError) {
@@ -462,7 +751,7 @@ export default function App() {
   }
 
   function toggleCandidate(candidate: MoveCandidate) {
-    if (candidate.destination_conflict) return
+    if (applyPending || candidate.destination_conflict) return
     setSelected((previous) => {
       const next = new Set(previous)
       if (next.has(candidate.candidate_id)) next.delete(candidate.candidate_id)
@@ -472,24 +761,25 @@ export default function App() {
   }
 
   async function confirmApply() {
-    if (!applyEnabled || !plan || !selected.size) return
-    setConfirmOpen(false)
-    setApplying(true)
-    setError(null)
-    try {
-      const result = await applyCandidates(plan.plan_id, plan.revision, [...selected])
-      setApplyResult(result)
-      if (result.results.some((item) => item.state === 'stale')) setNeedsFreshPlan(true)
-    } catch (applyError) {
-      if (applyError instanceof ApiError && applyError.code === 'unauthorized') setAuthRequired(true)
-      if (applyError instanceof ApiError && STALE_CODES.has(applyError.code)) setNeedsFreshPlan(true)
-      if (applyError instanceof ApiError && applyError.code === 'move_disabled') {
-        setHealth((current) => current ? { ...current, apply_enabled: false, apply_ready: false } : current)
-      }
-      setError(errorMessage(applyError))
-    } finally {
-      setApplying(false)
+    if (!applyEnabled || applyPending || !plan || !selected.size) return
+    const request: ActiveApplyRequest = {
+      planId: plan.plan_id,
+      revision: plan.revision,
+      candidateIds: [...selected],
+      requestId: createApplyRequestId(),
     }
+    setConfirmOpen(false)
+    applyGeneration.current += 1
+    activeApplyController.current?.abort()
+    setActiveApplyRequest(request)
+    setActiveApply(request)
+    setApplyJob(applyPlaceholder(request))
+    setApplyResult(null)
+    setApplyPollWarning(null)
+    setApplyPausedForAuth(false)
+    setApplyPlanRetryTick(0)
+    applyPollFailures.current = 0
+    setError(null)
   }
 
   async function copyAllMagnets() {
@@ -512,6 +802,8 @@ export default function App() {
     storeApiToken(apiTokenInput)
     setAuthConfigured(Boolean(apiTokenInput.trim()))
     setAuthRequired(false)
+    setApplyPausedForAuth(false)
+    setApplyRetryTick((value) => value + 1)
     setApiTokenInput('')
     setError(null)
   }
@@ -551,7 +843,7 @@ export default function App() {
               onChange={(event) => setInput(event.target.value)}
               placeholder={'例如：A12345, B67890\n支持空格、逗号或换行分隔'}
               rows={4}
-              disabled={submitting || jobPending}
+              disabled={submitting || jobPending || applyPending}
             />
             <div className="input-footer">
               <span>仅支持字母、数字、下划线和连字符</span>
@@ -586,25 +878,40 @@ export default function App() {
           <button
             className="button primary scan-button"
             type="button"
-            disabled={!parsed.actorIds.length || Boolean(parsed.invalid.length) || parsed.actorIds.length > MAX_ACTORS || submitting || jobPending}
+            disabled={!parsed.actorIds.length || Boolean(parsed.invalid.length) || parsed.actorIds.length > MAX_ACTORS || submitting || jobPending || applyPending}
             onClick={() => void startScan()}
           >
-            {submitting || jobPending ? <Spinner /> : <ScanIcon />}
-            {submitting ? '正在提交' : jobPending ? '正在扫描' : '开始扫描'}
+            {submitting || jobPending || applyPending ? <Spinner /> : <ScanIcon />}
+            {submitting ? '正在提交' : jobPending ? '正在扫描' : applyPending ? '移动处理中' : '开始扫描'}
           </button>
         </section>
 
         {(submitting || jobPending) && (
           <ProgressPanel
+            kind="scan"
             job={job}
             planId={planId}
             now={now}
             pollWarning={pollWarning}
             submitting={submitting}
+            pending={submitting || jobPending}
             cancelling={cancelling}
             onCancel={() => void cancelScan()}
           />
         )}
+
+        {applyJob && (applyPending || applyResult) && (
+          <ProgressPanel
+            kind="apply"
+            job={applyJob}
+            now={now}
+            pollWarning={applyPollWarning}
+            submitting={Boolean(applyPending && activeApply && !activeApply.jobId)}
+            pending={applyPending}
+          />
+        )}
+
+        {applyResult && <ApplySummary result={applyResult} />}
 
         {error && <Notice tone="error" title="操作未完成" body={error} />}
         {jobCancelled && (
@@ -615,7 +922,7 @@ export default function App() {
             tone="warning"
             title="扫描结果已失效"
             body="文件状态或计划版本已经变化。请重新扫描后再选择文件，避免使用过期结果。"
-            action={<button className="text-button" type="button" onClick={() => void startScan()}>重新扫描 <ArrowIcon /></button>}
+            action={<button className="text-button" type="button" disabled={applyPending} onClick={() => void startScan()}>重新扫描 <ArrowIcon /></button>}
           />
         )}
 
@@ -662,13 +969,12 @@ export default function App() {
                       selected={selected}
                       toggleCandidate={toggleCandidate}
                       applyResult={applyResult}
+                      selectionLocked={applyPending}
                     />
                   )
                 })}
               </div>
             </section>
-
-            {applyResult && <ApplySummary result={applyResult} />}
 
             {applyNotice && (
               <Notice
@@ -690,15 +996,15 @@ export default function App() {
                 disabled={
                   !applyEnabled
                   || !selected.size
-                  || applying
+                  || applyPending
                   || needsFreshPlan
                   || planExpired
                   || applyVerificationPending
                 }
                 onClick={() => applyEnabled && setConfirmOpen(true)}
               >
-                {applying ? <Spinner /> : <MoveIcon />}
-                {applying ? '正在移入' : applyResult ? '再次应用选择' : '确认并移入'}
+                {applyPending ? <Spinner /> : <MoveIcon />}
+                {applyPending ? '正在移入' : applyResult ? '再次应用选择' : '确认并移入'}
               </button>
             </div>
           </>
@@ -727,35 +1033,49 @@ export default function App() {
 }
 
 function ProgressPanel({
+  kind,
   job,
   planId,
   now,
   pollWarning,
   submitting,
+  pending,
   cancelling,
   onCancel,
 }: {
+  kind: 'scan' | 'apply'
   job: PlanJob | null
-  planId: string | null
+  planId?: string | null
   now: number
   pollWarning: string | null
   submitting: boolean
-  cancelling: boolean
-  onCancel: () => void
+  pending: boolean
+  cancelling?: boolean
+  onCancel?: () => void
 }) {
   const progress = job?.progress
   const value = progressValue(progress)
   const state = jobState(job)
   const stage = progress?.stage ?? null
-  const title = submitting
-    ? '正在提交任务'
-    : state === 'queued'
-      ? '任务已排队'
-      : stage
-        ? (STAGE_LABELS[stage] ?? '正在处理扫描任务')
-        : '正在恢复扫描状态'
-  const count = progressCount(progress)
-  const elapsed = stageElapsed(progress, now)
+  const title = kind === 'apply'
+    ? submitting
+      ? '正在提交移动任务'
+      : state === 'queued'
+        ? '移动任务已排队'
+        : state === 'running'
+          ? '正在移入文件'
+          : state === 'completed' || state === 'partial_failed'
+            ? '文件移动已完成'
+            : '文件移动未完成'
+    : submitting
+      ? '正在提交任务'
+      : state === 'queued'
+        ? '任务已排队'
+        : stage
+          ? (STAGE_LABELS[stage] ?? '正在处理扫描任务')
+          : '正在恢复扫描状态'
+  const count = progressCount(progress, kind)
+  const elapsed = stageElapsed(progress, now, pending)
   const eta = remainingEta(progress)
   const progressAge = lastProgressAge(progress, now)
   const heartbeatAge = secondsSince(job?.updated_at, now)
@@ -766,15 +1086,19 @@ function ProgressPanel({
     && heartbeatAge !== null
     && heartbeatAge >= HEARTBEAT_WARNING_SECONDS
   const valueText = count ?? (value === null ? '进度计算中' : `${Math.round(value)}%`)
-  const canCancel = Boolean(planId && (state === 'queued' || state === 'running'))
+  const canCancel = kind === 'scan' && Boolean(planId && (state === 'queued' || state === 'running'))
+  const titleId = `${kind}-progress-title`
+  const current = progress?.current
+    ? kind === 'apply' ? publicFileName(progress.current) : progress.current
+    : null
 
   return (
-    <section className="progress-panel" aria-busy="true" aria-labelledby="scan-progress-title">
-      <div className="progress-orbit"><Spinner /></div>
+    <section className="progress-panel" aria-busy={pending} aria-labelledby={titleId}>
+      <div className="progress-orbit">{pending ? <Spinner /> : <CheckIcon />}</div>
       <div className="progress-body">
         <div className="progress-copy" role="status" aria-live="polite" aria-atomic="true">
-          <strong id="scan-progress-title">{title}</strong>
-          <span>{progress?.current ? `当前：${progress.current}` : '正在等待最新进度…'}</span>
+          <strong id={titleId}>{title}</strong>
+          <span>{current ? `当前：${current}` : pending ? '正在等待最新进度…' : '所有文件均已处理。'}</span>
         </div>
 
         <div className="progress-meter">
@@ -809,12 +1133,12 @@ function ProgressPanel({
             {heartbeatWarning && <p>执行器心跳已较长时间未更新，执行可能已经中断。</p>}
           </div>
         )}
-        {canCancel && (
+        {canCancel && onCancel && (
           <div className="progress-actions">
             <button
               className="button secondary cancel-scan-button"
               type="button"
-              disabled={cancelling}
+              disabled={Boolean(cancelling)}
               onClick={onCancel}
             >
               {cancelling && <Spinner />}
@@ -927,12 +1251,14 @@ function VideoGroup({
   selected,
   toggleCandidate,
   applyResult,
+  selectionLocked,
 }: {
   group: (typeof VIDEO_GROUPS)[number]
   videos: VideoPlan[]
   selected: Set<string>
   toggleCandidate: (candidate: MoveCandidate) => void
   applyResult: ApplyResult | null
+  selectionLocked: boolean
 }) {
   const [expanded, setExpanded] = useState(true)
   return (
@@ -952,6 +1278,7 @@ function VideoGroup({
               selected={selected}
               toggleCandidate={toggleCandidate}
               applyResult={applyResult}
+              selectionLocked={selectionLocked}
             />
           ))}
         </div>
@@ -965,11 +1292,13 @@ function VideoRow({
   selected,
   toggleCandidate,
   applyResult,
+  selectionLocked,
 }: {
   video: VideoPlan
   selected: Set<string>
   toggleCandidate: (candidate: MoveCandidate) => void
   applyResult: ApplyResult | null
+  selectionLocked: boolean
 }) {
   const magnet = safeMagnet(video.magnet)
   return (
@@ -987,7 +1316,7 @@ function VideoRow({
               <input
                 type="checkbox"
                 checked={selected.has(candidate.candidate_id)}
-                disabled={candidate.destination_conflict}
+                disabled={candidate.destination_conflict || selectionLocked}
                 onChange={() => toggleCandidate(candidate)}
               />
               <span className="custom-check"><CheckIcon /></span>
