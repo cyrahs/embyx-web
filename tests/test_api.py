@@ -15,8 +15,10 @@ from embyx_web.fill_actor.persistence import (
     JOB_CANCELLED_ERROR_CODE,
     JobFeedRecord,
     JobFeedState,
+    JobOperation,
     JobProgress,
     JobProgressUnit,
+    JobRecord,
     JobStage,
     JobState,
     MemoryFillActorRepository,
@@ -102,6 +104,17 @@ def wait_for_plan(client: TestClient, plan_id: str) -> dict:
     pytest.fail('plan job did not complete')
 
 
+def wait_for_apply_job(client: TestClient, job_id: str) -> dict:
+    for _ in range(100):
+        response = client.get(f'/api/fill-actor/apply-jobs/{job_id}')
+        assert response.status_code == 200
+        payload = response.json()
+        if payload['job']['state'] not in {'queued', 'running'}:
+            return payload
+        time.sleep(0.005)
+    pytest.fail('apply job did not complete')
+
+
 def test_plan_job_and_apply_end_to_end(tmp_path: Path) -> None:
     client, paths, _ = make_client(tmp_path)
     brand_path = paths.additional_brand_paths[0] / 'ABC'
@@ -135,6 +148,135 @@ def test_plan_job_and_apply_end_to_end(tmp_path: Path) -> None:
     assert applied.json()['results'][0]['state'] == 'moved'
     assert not source.exists()
     assert (paths.move_in_path / source.name).read_bytes() == b'video'
+
+
+def test_persistent_apply_job_moves_serially_and_is_idempotent(tmp_path: Path) -> None:
+    client, paths, _ = make_client(tmp_path)
+    brand_path = paths.additional_brand_paths[0] / 'ABC'
+    brand_path.mkdir()
+    source = brand_path / 'ABC-001.mp4'
+    source.write_bytes(b'video')
+    request_id = 'apply-request-0001'
+
+    with client:
+        created = client.post('/api/fill-actor/plans', json={'actor_ids': ['actor']})
+        plan_id = created.json()['job']['plan_id']
+        plan = wait_for_plan(client, plan_id)['plan']
+        candidate_id = plan['videos'][0]['move_candidates'][0]['candidate_id']
+        request = {
+            'revision': plan['revision'],
+            'candidate_ids': [candidate_id, candidate_id],
+            'request_id': request_id,
+        }
+
+        started = client.post(f'/api/fill-actor/plans/{plan_id}/apply-jobs', json=request)
+        terminal = wait_for_apply_job(client, request_id)
+        repeated = client.post(f'/api/fill-actor/plans/{plan_id}/apply-jobs', json=request)
+        conflict = client.post(
+            f'/api/fill-actor/plans/{plan_id}/apply-jobs',
+            json={**request, 'candidate_ids': []},
+        )
+        cancelled = client.post(f'/api/fill-actor/plans/{request_id}/cancel')
+
+    assert started.status_code == 202
+    assert started.json()['job']['operation'] == 'apply'
+    assert terminal['job']['state'] == 'completed'
+    assert terminal['job']['progress']['completed'] == 1
+    assert terminal['job']['progress']['total'] == 1
+    assert terminal['job']['progress']['current'] is None
+    assert terminal['result']['state'] == 'succeeded'
+    assert terminal['result']['results'][0]['state'] == 'moved'
+    assert repeated.status_code == 202
+    assert repeated.json() == terminal
+    assert conflict.status_code == 409
+    assert conflict.json() == {'error': {'code': 'apply_request_conflict'}}
+    assert cancelled.status_code == 409
+    assert cancelled.json() == {'error': {'code': 'apply_job_not_cancellable'}}
+    assert not source.exists()
+    assert (paths.move_in_path / source.name).read_bytes() == b'video'
+
+
+def test_empty_apply_job_recovers_by_id_when_readiness_changes(tmp_path: Path) -> None:
+    client, paths, _ = make_client(tmp_path)
+    request_id = 'empty-apply-request-0001'
+    with client:
+        created = client.post('/api/fill-actor/plans', json={'actor_ids': ['actor']})
+        plan_id = created.json()['job']['plan_id']
+        plan = wait_for_plan(client, plan_id)['plan']
+        request = {'revision': plan['revision'], 'candidate_ids': [], 'request_id': request_id}
+        started = client.post(f'/api/fill-actor/plans/{plan_id}/apply-jobs', json=request)
+        terminal = wait_for_apply_job(client, request_id)
+        paths.move_in_path.rmdir()
+
+        recovered = client.get(f'/api/fill-actor/apply-jobs/{request_id}')
+        repeated = client.post(f'/api/fill-actor/plans/{plan_id}/apply-jobs', json=request)
+        unavailable = client.post(
+            f'/api/fill-actor/plans/{plan_id}/apply-jobs',
+            json={**request, 'request_id': 'empty-apply-request-0002'},
+        )
+
+    assert started.status_code == 202
+    assert terminal['job']['state'] == 'completed'
+    assert terminal['job']['progress']['completed'] == 0
+    assert terminal['job']['progress']['total'] == 0
+    assert terminal['job']['progress']['percent'] == 100.0
+    assert terminal['result']['state'] == 'succeeded'
+    assert terminal['result']['results'] == []
+    assert recovered.status_code == 200
+    assert recovered.json() == terminal
+    assert repeated.status_code == 202
+    assert repeated.json() == terminal
+    assert unavailable.status_code == 503
+    assert unavailable.json() == {'error': {'code': 'not_ready'}}
+
+
+def test_apply_job_requires_a_published_create_plan(tmp_path: Path) -> None:
+    client, _, repository = make_client(tmp_path)
+    with client:
+        created = client.post('/api/fill-actor/plans', json={'actor_ids': ['actor']})
+        plan_id = created.json()['job']['plan_id']
+        plan = wait_for_plan(client, plan_id)['plan']
+        assert client.portal is not None
+        assert client.portal.call(repository.delete_plan, plan_id)
+
+        missing = client.post(
+            f'/api/fill-actor/plans/{plan_id}/apply-jobs',
+            json={
+                'revision': plan['revision'],
+                'candidate_ids': [],
+                'request_id': 'missing-plan-request-0001',
+            },
+        )
+
+    assert missing.status_code == 404
+    assert missing.json() == {'error': {'code': 'unknown_plan'}}
+
+
+def test_apply_job_does_not_accept_an_apply_operation_as_its_parent(tmp_path: Path) -> None:
+    client, _, repository = make_client(tmp_path)
+    now = datetime.now(UTC)
+    impostor = JobRecord(
+        job_id='not-a-create-plan',
+        plan_id='some-parent',
+        operation=JobOperation.APPLY,
+        state=JobState.COMPLETED,
+        created_at=now,
+        updated_at=now,
+    )
+    with client:
+        assert client.portal is not None
+        client.portal.call(repository.save_job, impostor)
+        response = client.post(
+            f'/api/fill-actor/plans/{impostor.job_id}/apply-jobs',
+            json={
+                'revision': 'revision',
+                'candidate_ids': [],
+                'request_id': 'operation-check-request-0001',
+            },
+        )
+
+    assert response.status_code == 404
+    assert response.json() == {'error': {'code': 'unknown_plan'}}
 
 
 def test_plan_envelope_exposes_persisted_feed_status_and_freshrss_action(tmp_path: Path) -> None:
@@ -238,11 +380,21 @@ def test_mutations_require_configured_bearer_token(tmp_path: Path) -> None:
             json={'actor_ids': ['actor']},
             headers={'Authorization': f'Bearer {token}'},
         )
+        denied_apply_poll = client.get('/api/fill-actor/apply-jobs/predictable-request')
+        allowed_apply_poll = client.get(
+            '/api/fill-actor/apply-jobs/predictable-request',
+            headers={'Authorization': f'Bearer {token}'},
+        )
 
     assert denied.status_code == 401
     assert denied.json() == {'error': {'code': 'unauthorized'}}
     assert 'WWW-Authenticate' in denied.headers
     assert allowed.status_code == 202
+    assert denied_apply_poll.status_code == 401
+    assert denied_apply_poll.json() == {'error': {'code': 'unauthorized'}}
+    assert 'WWW-Authenticate' in denied_apply_poll.headers
+    assert allowed_apply_poll.status_code == 404
+    assert allowed_apply_poll.json() == {'error': {'code': 'unknown_apply_job'}}
 
 
 def test_cancel_running_plan_is_authenticated_idempotent_and_does_not_require_roots(tmp_path: Path) -> None:
@@ -296,12 +448,18 @@ def test_api_maps_service_errors_without_raw_messages(tmp_path: Path) -> None:
     with client:
         invalid = client.post('/api/fill-actor/plans', json={'actor_ids': ['bad actor']})
         malformed = client.post('/api/fill-actor/plans', json={'actor_ids': ['actor'], 'unexpected': True})
+        invalid_request_id = client.post(
+            '/api/fill-actor/plans/not-found/apply-jobs',
+            json={'revision': 'revision', 'candidate_ids': [], 'request_id': 'a' * 129},
+        )
         unknown = client.get('/api/fill-actor/plans/not-found')
 
     assert invalid.status_code == 422
     assert invalid.json() == {'error': {'code': 'invalid_actor_id'}}
     assert malformed.status_code == 422
     assert malformed.json() == {'error': {'code': 'invalid_request'}}
+    assert invalid_request_id.status_code == 422
+    assert invalid_request_id.json() == {'error': {'code': 'invalid_request'}}
     assert unknown.status_code == 404
     assert unknown.json() == {'error': {'code': 'unknown_plan'}}
 

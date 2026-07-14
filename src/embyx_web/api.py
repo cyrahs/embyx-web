@@ -17,6 +17,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from embyx_web.fill_actor.errors import (
+    ApplyJobNotCancellableError,
+    ApplyRequestConflictError,
     ExpiredPlanError,
     FillActorError,
     InvalidActorIdError,
@@ -26,6 +28,7 @@ from embyx_web.fill_actor.errors import (
     RevisionMismatchError,
     TooManyActorsError,
     TooManyVideosError,
+    UnknownApplyJobError,
     UnknownCandidateError,
     UnknownPlanError,
 )
@@ -36,6 +39,7 @@ from embyx_web.fill_actor.persistence import (
     CancelJobOutcome,
     FillActorRepository,
     JobFeedRecord,
+    JobOperation,
     JobProgress,
     JobRecord,
     JobStage,
@@ -58,6 +62,10 @@ class ApplyPlanRequest(BaseModel):
 
     revision: str = Field(min_length=1, max_length=256)
     candidate_ids: list[str] = Field(default_factory=list, max_length=5_000)
+
+
+class CreateApplyJobRequest(ApplyPlanRequest):
+    request_id: str = Field(min_length=16, max_length=128, pattern=r'^[A-Za-z0-9_-]+$')
 
 
 class JobProgressView(BaseModel):
@@ -173,6 +181,11 @@ class PlanEnvelope(BaseModel):
     job: JobView
     plan: FillActorPlan | None
     feeds: tuple[ActorFeedView, ...]
+
+
+class ApplyJobEnvelope(BaseModel):
+    job: JobView
+    result: ApplyResult | None
 
 
 class ApiError(Exception):
@@ -295,6 +308,8 @@ def create_app(  # noqa: C901, PLR0913, PLR0915
             raise ApiError(503, 'not_ready')
 
     async def require_apply_ready() -> None:
+        if not service.apply_enabled:
+            raise MoveDisabledError
         if not await repository.health_check() or not await service.apply_ready():
             raise ApiError(503, 'not_ready')
 
@@ -388,6 +403,56 @@ def create_app(  # noqa: C901, PLR0913, PLR0915
         )
 
     @app.post(
+        '/api/fill-actor/plans/{plan_id}/apply-jobs',
+        status_code=202,
+        dependencies=[Depends(require_mutation_auth)],
+    )
+    async def create_apply_job(plan_id: str, request: CreateApplyJobRequest) -> ApplyJobEnvelope:
+        normalized_candidate_ids = tuple(dict.fromkeys(request.candidate_ids))
+        existing = await jobs.get_apply_job(request.request_id)
+        if existing is not None:
+            existing_plan_id = (
+                existing.job.plan_id
+                if existing.job.plan_id is not None
+                else existing.result.plan_id
+                if existing.result is not None
+                else None
+            )
+            if (
+                existing_plan_id == plan_id
+                and existing.revision == request.revision
+                and existing.candidate_ids == normalized_candidate_ids
+            ):
+                return ApplyJobEnvelope(job=JobView.from_record(existing.job), result=existing.result)
+            raise ApplyRequestConflictError(request.request_id)
+
+        await require_apply_ready()
+        plan_job = await jobs.get_job(plan_id)
+        if plan_job is None or plan_job.operation is not JobOperation.CREATE_PLAN:
+            raise UnknownPlanError(plan_id)
+        if plan_job.state not in {JobState.COMPLETED, JobState.PARTIAL_FAILED}:
+            raise ApiError(409, 'plan_not_ready')
+        if await jobs.get_plan(plan_id) is None:
+            raise UnknownPlanError(plan_id)
+        record = await jobs.start_apply(
+            plan_id=plan_id,
+            revision=request.revision,
+            candidate_ids=request.candidate_ids,
+            request_id=request.request_id,
+        )
+        return ApplyJobEnvelope(job=JobView.from_record(record.job), result=record.result)
+
+    @app.get(
+        '/api/fill-actor/apply-jobs/{job_id}',
+        dependencies=[Depends(require_mutation_auth)],
+    )
+    async def get_apply_job(job_id: str) -> ApplyJobEnvelope:
+        record = await jobs.get_apply_job(job_id)
+        if record is None:
+            raise UnknownApplyJobError(job_id)
+        return ApplyJobEnvelope(job=JobView.from_record(record.job), result=record.result)
+
+    @app.post(
         '/api/fill-actor/plans/{plan_id}/apply',
         dependencies=[Depends(require_mutation_auth), Depends(require_apply_ready)],
     )
@@ -434,9 +499,12 @@ def _service_error_status(exc: FillActorError) -> int:
         (InvalidActorIdError, 422),
         (TooManyActorsError, 422),
         (TooManyVideosError, 422),
+        (ApplyRequestConflictError, 409),
+        (ApplyJobNotCancellableError, 409),
         (MoveDisabledError, 503),
         (LegacyPlanError, 409),
         (UnknownPlanError, 404),
+        (UnknownApplyJobError, 404),
         (ExpiredPlanError, 410),
         (RevisionMismatchError, 409),
         (UnknownCandidateError, 422),

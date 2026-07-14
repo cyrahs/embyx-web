@@ -70,6 +70,7 @@ CLOUD_VERIFY_ATTEMPTS = 5
 CLOUD_HEALTH_SUCCESS_TTL_SECONDS = 30.0
 CLOUD_HEALTH_FAILURE_TTL_SECONDS = 5.0
 ProgressCallback = Callable[[JobProgressEvent], Awaitable[None]]
+StopCallback = Callable[[], bool]
 
 
 @dataclass(frozen=True)
@@ -680,7 +681,15 @@ class FillActorService:
         pattern = re.compile(rf'^{re.escape(video_id)}(?:-cd\d{{1,2}})?\..+', re.IGNORECASE)
         return bool(pattern.fullmatch(file_name))
 
-    async def apply(self, *, plan_id: str, revision: str, candidate_ids: Sequence[str]) -> ApplyResult:
+    async def apply(
+        self,
+        *,
+        plan_id: str,
+        revision: str,
+        candidate_ids: Sequence[str],
+        progress: ProgressCallback | None = None,
+        stop_requested: StopCallback | None = None,
+    ) -> ApplyResult:
         if not self._apply_enabled:
             raise MoveDisabledError
         async with self._apply_lock:
@@ -696,20 +705,47 @@ class FillActorService:
                 raise LegacyPlanError
 
             results: list[MoveResult] = []
-            for candidate_id in selected:
+            await self._report_progress(
+                progress,
+                JobProgressEvent(
+                    stage=JobStage.UNKNOWN,
+                    completed=0,
+                    total=len(selected),
+                    unit=JobProgressUnit.ITEMS,
+                    current=self._candidate_file_name(candidates[selected[0]]) if selected else None,
+                ),
+            )
+            for index, candidate_id in enumerate(selected):
+                if stop_requested is not None and stop_requested():
+                    break
                 cached = await self._repository.get_move_result(plan_id, candidate_id)
                 if cached is not None:
                     results.append(cached)
-                    continue
-                record = candidates[candidate_id]
-                task_key = (plan_id, candidate_id)
-                worker = self._in_flight.get(task_key)
-                if worker is None:
-                    worker = asyncio.create_task(self._run_move(plan_id, record))
-                    self._in_flight[task_key] = worker
-                    worker.add_done_callback(partial(self._discard_in_flight, task_key))
-                result = await asyncio.shield(worker)
-                results.append(result)
+                else:
+                    record = candidates[candidate_id]
+                    task_key = (plan_id, candidate_id)
+                    worker = self._in_flight.get(task_key)
+                    if worker is None:
+                        worker = asyncio.create_task(self._run_move(plan_id, record))
+                        self._in_flight[task_key] = worker
+                        worker.add_done_callback(partial(self._discard_in_flight, task_key))
+                    result = await asyncio.shield(worker)
+                    results.append(result)
+                completed = index + 1
+                await self._report_progress(
+                    progress,
+                    JobProgressEvent(
+                        stage=JobStage.UNKNOWN,
+                        completed=completed,
+                        total=len(selected),
+                        unit=JobProgressUnit.ITEMS,
+                        current=(
+                            self._candidate_file_name(candidates[selected[completed]])
+                            if completed < len(selected)
+                            else None
+                        ),
+                    ),
+                )
 
         return ApplyResult(
             plan_id=plan_id,
@@ -717,6 +753,12 @@ class FillActorService:
             state=self._get_apply_state(results),
             results=tuple(results),
         )
+
+    @staticmethod
+    def _candidate_file_name(record: CandidateRecord) -> str:
+        if record.cloud_file is not None:
+            return PurePosixPath(record.cloud_file.name.replace('\\', '/')).name
+        return record.source.name
 
     def _validate_actor_ids(self, actor_ids: Sequence[str]) -> tuple[str, ...]:
         normalized = tuple(dict.fromkeys(actor_id.strip() for actor_id in actor_ids))

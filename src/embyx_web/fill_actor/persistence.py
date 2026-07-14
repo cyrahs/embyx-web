@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Protocol
 
 from embyx_web.fill_actor.cloud_moves import CloudFileMetadata
-from embyx_web.fill_actor.models import FillActorPlan, MoveResult
+from embyx_web.fill_actor.models import ApplyResult, FillActorPlan, MoveResult
 
 SHA256_HEX_LENGTH = 64
 
@@ -27,7 +27,15 @@ class CancelJobOutcome(StrEnum):
     CANCELLED = 'cancelled'
     ALREADY_CANCELLED = 'already_cancelled'
     ALREADY_TERMINAL = 'already_terminal'
+    NOT_CANCELLABLE = 'not_cancellable'
     NOT_FOUND = 'not_found'
+
+
+class EnqueueApplyJobOutcome(StrEnum):
+    ENQUEUED = 'enqueued'
+    EXISTING = 'existing'
+    CONFLICT = 'conflict'
+    FULL = 'full'
 
 
 class JobOperation(StrEnum):
@@ -243,6 +251,41 @@ class JobRecord:
 
 
 @dataclass(frozen=True)
+class ApplyJobRecord:
+    job: JobRecord
+    revision: str
+    candidate_ids: tuple[str, ...]
+    result: ApplyResult | None = None
+
+    def __post_init__(self) -> None:
+        if self.job.operation is not JobOperation.APPLY:
+            msg = 'apply job records require the apply operation'
+            raise ValueError(msg)
+        if not self.revision:
+            msg = 'apply job revision must not be empty'
+            raise ValueError(msg)
+        if len(self.candidate_ids) != len(set(self.candidate_ids)):
+            msg = 'apply job candidate ids must be unique'
+            raise ValueError(msg)
+        if self.result is not None:
+            if self.job.state is not JobState.COMPLETED:
+                msg = 'apply results require a completed job'
+                raise ValueError(msg)
+            if self.result.revision != self.revision:
+                msg = 'apply result revision must match its job'
+                raise ValueError(msg)
+            if self.job.plan_id is not None and self.result.plan_id != self.job.plan_id:
+                msg = 'apply result plan id must match its job'
+                raise ValueError(msg)
+
+
+@dataclass(frozen=True)
+class EnqueueApplyJobResult:
+    outcome: EnqueueApplyJobOutcome
+    record: ApplyJobRecord | None
+
+
+@dataclass(frozen=True)
 class CancelJobResult:
     outcome: CancelJobOutcome
     job: JobRecord | None
@@ -350,6 +393,15 @@ class FillActorRepository(Protocol):
         feeds: Sequence[JobFeedRecord] = (),
     ) -> bool: ...
 
+    async def enqueue_apply_job(
+        self,
+        record: ApplyJobRecord,
+        *,
+        max_active: int,
+    ) -> EnqueueApplyJobResult: ...
+
+    async def get_apply_job(self, job_id: str) -> ApplyJobRecord | None: ...
+
     async def claim_next_job(
         self,
         *,
@@ -385,6 +437,7 @@ class FillActorRepository(Protocol):
         error_code: str | None,
         now: datetime,
         progress: JobProgress,
+        apply_result: ApplyResult | None = None,
     ) -> bool: ...
 
     async def cancel_job(self, *, job_id: str, now: datetime) -> CancelJobResult: ...
@@ -435,6 +488,7 @@ class MemoryFillActorRepository:
         self._plans: dict[str, PlanRecord] = {}
         self._move_results: dict[tuple[str, str], MoveResult] = {}
         self._jobs: dict[str, JobRecord] = {}
+        self._apply_jobs: dict[str, ApplyJobRecord] = {}
         self._job_feeds: dict[tuple[str, str], JobFeedRecord] = {}
         self._move_journal: dict[tuple[str, str], MoveJournalRecord] = {}
         self._cloud_move_operations: dict[tuple[str, str], CloudMoveOperationRecord] = {}
@@ -472,12 +526,21 @@ class MemoryFillActorRepository:
 
     async def delete_plan(self, plan_id: str) -> bool:
         async with self._lock:
-            if any(
-                key[0] == plan_id and journal.state is not MoveJournalState.RECONCILED
-                for key, journal in self._move_journal.items()
-            ) or any(
-                key[0] == plan_id and not operation.state.terminal
-                for key, operation in self._cloud_move_operations.items()
+            if (
+                any(
+                    key[0] == plan_id and journal.state is not MoveJournalState.RECONCILED
+                    for key, journal in self._move_journal.items()
+                )
+                or any(
+                    key[0] == plan_id and not operation.state.terminal
+                    for key, operation in self._cloud_move_operations.items()
+                )
+                or any(
+                    job.operation is JobOperation.APPLY
+                    and job.plan_id == plan_id
+                    and job.state in {JobState.QUEUED, JobState.RUNNING}
+                    for job in self._jobs.values()
+                )
             ):
                 return False
             removed = self._plans.pop(plan_id, None) is not None
@@ -499,6 +562,12 @@ class MemoryFillActorRepository:
                 and not any(
                     key[0] == plan_id and not operation.state.terminal
                     for key, operation in self._cloud_move_operations.items()
+                )
+                and not any(
+                    job.operation is JobOperation.APPLY
+                    and job.plan_id == plan_id
+                    and job.state in {JobState.QUEUED, JobState.RUNNING}
+                    for job in self._jobs.values()
                 )
             ]
             for plan_id in expired:
@@ -541,6 +610,53 @@ class MemoryFillActorRepository:
             self._jobs[record.job_id] = record
             self._job_feeds.update({(feed.job_id, feed.actor_id): feed for feed in feeds})
             return True
+
+    async def enqueue_apply_job(
+        self,
+        record: ApplyJobRecord,
+        *,
+        max_active: int,
+    ) -> EnqueueApplyJobResult:
+        async with self._lock:
+            existing_job = self._jobs.get(record.job.job_id)
+            if existing_job is not None:
+                existing = self._apply_jobs.get(record.job.job_id)
+                if (
+                    existing is not None
+                    and existing.job.plan_id == record.job.plan_id
+                    and existing.revision == record.revision
+                    and existing.candidate_ids == record.candidate_ids
+                ):
+                    return EnqueueApplyJobResult(
+                        EnqueueApplyJobOutcome.EXISTING,
+                        ApplyJobRecord(
+                            job=existing_job,
+                            revision=existing.revision,
+                            candidate_ids=existing.candidate_ids,
+                            result=existing.result,
+                        ),
+                    )
+                return EnqueueApplyJobResult(EnqueueApplyJobOutcome.CONFLICT, None)
+
+            active = sum(job.state in {JobState.QUEUED, JobState.RUNNING} for job in self._jobs.values())
+            if active >= max_active:
+                return EnqueueApplyJobResult(EnqueueApplyJobOutcome.FULL, None)
+            self._jobs[record.job.job_id] = record.job
+            self._apply_jobs[record.job.job_id] = record
+            return EnqueueApplyJobResult(EnqueueApplyJobOutcome.ENQUEUED, record)
+
+    async def get_apply_job(self, job_id: str) -> ApplyJobRecord | None:
+        async with self._lock:
+            stored = self._apply_jobs.get(job_id)
+            job = self._jobs.get(job_id)
+            if stored is None or job is None:
+                return None
+            return ApplyJobRecord(
+                job=job,
+                revision=stored.revision,
+                candidate_ids=stored.candidate_ids,
+                result=stored.result,
+            )
 
     async def claim_next_job(
         self,
@@ -632,6 +748,7 @@ class MemoryFillActorRepository:
         error_code: str | None,
         now: datetime,
         progress: JobProgress,
+        apply_result: ApplyResult | None = None,
     ) -> bool:
         async with self._lock:
             current = self._jobs.get(job_id)
@@ -643,7 +760,7 @@ class MemoryFillActorRepository:
                 or normalize_datetime(current.lease_expires_at) <= normalize_datetime(now)
             ):
                 return False
-            self._jobs[job_id] = _replace_job(
+            finished_job = _replace_job(
                 current,
                 state=state,
                 updated_at=now,
@@ -652,6 +769,21 @@ class MemoryFillActorRepository:
                 lease_expires_at=None,
                 progress=progress,
             )
+            finished_apply: ApplyJobRecord | None = None
+            if apply_result is not None:
+                apply_job = self._apply_jobs.get(job_id)
+                if apply_job is None:
+                    msg = 'apply result requires an apply job'
+                    raise ValueError(msg)
+                finished_apply = ApplyJobRecord(
+                    job=finished_job,
+                    revision=apply_job.revision,
+                    candidate_ids=apply_job.candidate_ids,
+                    result=apply_result,
+                )
+            self._jobs[job_id] = finished_job
+            if finished_apply is not None:
+                self._apply_jobs[job_id] = finished_apply
             return True
 
     async def cancel_job(self, *, job_id: str, now: datetime) -> CancelJobResult:
@@ -659,6 +791,13 @@ class MemoryFillActorRepository:
             current = self._jobs.get(job_id)
             if current is None:
                 return CancelJobResult(CancelJobOutcome.NOT_FOUND, None)
+            if current.operation is JobOperation.APPLY:
+                return CancelJobResult(
+                    CancelJobOutcome.NOT_CANCELLABLE,
+                    current,
+                    previous_state=current.state,
+                    previous_owner_id=current.owner_id,
+                )
             if current.state is JobState.FAILED and current.error_code == JOB_CANCELLED_ERROR_CODE:
                 return CancelJobResult(
                     CancelJobOutcome.ALREADY_CANCELLED,
@@ -681,7 +820,11 @@ class MemoryFillActorRepository:
                 error_code=JOB_CANCELLED_ERROR_CODE,
                 owner_id=None,
                 lease_expires_at=None,
-                progress=_terminal_progress(current.progress, now),
+                progress=_terminal_progress(
+                    current.progress,
+                    now,
+                    clear_current=current.operation is JobOperation.APPLY,
+                ),
             )
             self._jobs[job_id] = cancelled
             for key, feed in tuple(self._job_feeds.items()):
@@ -719,7 +862,11 @@ class MemoryFillActorRepository:
                     error_code=error_code,
                     owner_id=None,
                     lease_expires_at=None,
-                    progress=_terminal_progress(job.progress, now),
+                    progress=_terminal_progress(
+                        job.progress,
+                        now,
+                        clear_current=job.operation is JobOperation.APPLY,
+                    ),
                 )
                 for key, feed in tuple(self._job_feeds.items()):
                     if key[0] == job.job_id and feed.state in {JobFeedState.QUEUED, JobFeedState.WARMING}:
@@ -857,6 +1004,15 @@ class MemoryFillActorRepository:
         self._jobs = {
             job_id: record if record.plan_id != plan_id else _without_plan(record)
             for job_id, record in self._jobs.items()
+        }
+        self._apply_jobs = {
+            job_id: ApplyJobRecord(
+                job=self._jobs[job_id],
+                revision=record.revision,
+                candidate_ids=record.candidate_ids,
+                result=record.result,
+            )
+            for job_id, record in self._apply_jobs.items()
         }
 
     def _require_candidate(self, plan_id: str, candidate_id: str) -> CandidateRecord:
@@ -1020,7 +1176,12 @@ def _replace_job(  # noqa: PLR0913
     )
 
 
-def _terminal_progress(progress: JobProgress | None, now: datetime) -> JobProgress:
+def _terminal_progress(
+    progress: JobProgress | None,
+    now: datetime,
+    *,
+    clear_current: bool = False,
+) -> JobProgress:
     if progress is None:
         return JobProgress(
             stage=JobStage.DONE,
@@ -1036,7 +1197,7 @@ def _terminal_progress(progress: JobProgress | None, now: datetime) -> JobProgre
         completed=progress.completed,
         total=progress.total,
         unit=progress.unit,
-        current=progress.current,
+        current=None if clear_current else progress.current,
         stage_started_at=now,
         updated_at=now,
     )
