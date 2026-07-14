@@ -76,7 +76,8 @@ export interface JobProgress {
 export interface PlanJob {
   id?: string
   job_id?: string
-  plan_id?: string
+  plan_id?: string | null
+  operation?: 'create_plan' | 'apply'
   state?: JobState
   status?: JobState
   error_code?: string | null
@@ -99,4 +100,18 @@ export interface PlanEnvelope {
   job: PlanJob | null
   planId: string | null
   feeds: ActorFeedStatus[]
+}
+
+export interface ApplyJobEnvelope {
+  job: PlanJob
+  result: ApplyResult | null
+}
+
+export interface ActiveApplyRequest {
+  planId: string
+  revision: string
+  candidateIds: string[]
+  requestId: string
+  jobId?: string
+  retrySubmitIfMissing?: boolean
 }

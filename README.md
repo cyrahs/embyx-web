@@ -9,16 +9,16 @@ and a packaged React management page while keeping filesystem mutation independe
 - SQLite and in-memory repositories for plans, private candidates, results, durable jobs, leases, and local/CloudDrive
   move journals.
 - Explicit SQLite migrations, WAL mode, write-readiness probes, cancellation-safe operations, and restart recovery.
-- A bounded persisted scan queue with atomic claim/lease/heartbeat fencing across processes and durable, idempotent
-  cancellation of queued or running scans.
+- A bounded persisted scan/apply queue with atomic claim/lease/heartbeat fencing across processes, durable file-level
+  apply progress, and durable, idempotent cancellation of queued or running scans.
 - Strict `.strm` parsing that maps a configured mount namespace to CloudDrive API-native paths, snapshots remote file
   identity, and moves only the referenced video through CloudDrive with conflict policy `Skip`.
 - Observation-only recovery for ambiguous CloudDrive timeouts and restarts. Legacy local journal records are never
   replayed in CloudDrive mode; they keep apply unavailable until an operator resolves or migrates them.
 - FastAPI endpoints with stable JSON error codes, request/actor/video limits, readiness checks, and Bearer auth for writes.
-- React + TypeScript + Vite UI with polling, in-progress scan cancellation, grouped results, move confirmation,
-  conflicts, partial failures, one-click bulk magnet copying, RSSHub cache readiness, FreshRSS hand-off, and
-  stale-plan recovery.
+- React + TypeScript + Vite UI with polling, refresh-safe scan and move progress, in-progress scan cancellation,
+  grouped results, move confirmation, conflicts, partial failures, one-click bulk magnet copying, RSSHub cache
+  readiness, FreshRSS hand-off, and stale-plan recovery.
 - Per-actor RSSHub feed prewarming persisted alongside scan jobs, with lease-fenced updates and cache-HIT detection before
   a FreshRSS subscription action is exposed.
 - Static frontend assets included in the Python wheel.
@@ -131,7 +131,13 @@ or mounting the media PVC cannot supply code that is absent from the image.
   `state=failed` with `error_code=job_cancelled`, which the UI presents as a neutral cancellation rather than a
   failure. This mutation requires Bearer auth but remains available when media roots are temporarily unavailable.
 - `POST /api/fill-actor/plans/{plan_id}/apply` accepts only a published plan and applies opaque candidate IDs with
-  revision checking.
+  revision checking. This synchronous endpoint remains available for API compatibility.
+- `POST /api/fill-actor/plans/{plan_id}/apply-jobs` accepts a client-generated request ID and atomically enqueues a
+  durable apply job. Repeating the same ID with the same plan, revision, and ordered candidate set returns the same
+  job; reusing it for a different request returns a conflict.
+- `GET /api/fill-actor/apply-jobs/{job_id}` returns the apply job and its final result once available. Progress counts
+  candidates that have reached a persisted outcome, including conflicts and failures; it does not claim byte-level
+  CloudDrive transfer progress.
 - `GET /api/health` reports database write-readiness and root/sentinel readiness.
 
 Responses never expose private paths or raw exception messages. The queue defaults to 2 workers and at most 32 active
@@ -144,6 +150,11 @@ cleanup asynchronously. Filesystem enumeration uses cooperative cancellation and
 and directory entries. A single NFS system call already blocked inside the kernel cannot be interrupted safely; a
 local-owner cancellation response waits for that call to return and for the scan worker to exit instead of claiming
 the task stopped while background I/O is still active.
+
+Apply jobs are deliberately not cancellable. Once a local or CloudDrive move has started, the current candidate is
+allowed to reach a durable outcome; shutdown or lost ownership prevents subsequent candidates from starting. The UI
+stores only the opaque apply job identity and public request metadata in session storage so a refresh or lost POST
+response can resume polling without submitting a second move.
 
 When RSSHub integration is enabled, each scan schedules the cluster-local `/javbus/star/{actor-id}` request before
 actor catalog scanning begins. A background `HEAD` probe waits for a successful XML response carrying
@@ -244,6 +255,13 @@ bash tests/container_smoke.sh embyx-web:ci
 Pushes to the default branch run the same backend, frontend, and container contract checks before publishing
 `ghcr.io/<owner>/embyx-web:latest` plus an immutable `sha-<commit>` tag for both `linux/amd64` and `linux/arm64`.
 Production GitOps should resolve the published manifest and pin its digest rather than deploy the mutable tag.
+
+Schema 6 adds the `apply_jobs` table. Before upgrading an existing SQLite database, take and verify an online backup
+while no jobs are queued or running. Images that only understand schema 5 cannot start against a migrated database;
+rolling back to such an image therefore also requires restoring the matching schema-5 backup. Prefer a forward fix
+after any real move has run on schema 6 so its audit records are not discarded. For a staged production rollout,
+deploy and verify the schema-6 backend with the previous UI first, then use that image as the rollback target while
+enabling the asynchronous progress UI.
 
 Operators must keep the database, lock file, runtime package, and configured media roots writable only by trusted
 users.
